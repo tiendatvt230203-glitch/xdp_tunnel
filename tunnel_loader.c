@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// XDP Tunnel Loader - TCP/UDP
+// XDP Tunnel Loader - TCP/UDP (Refactored)
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,8 +25,16 @@
 
 #define MAX_WAN 3
 
-static volatile int running = 1;
-static struct bpf_object *obj = NULL;
+// ==================== Data Structures ====================
+
+struct wan_info {
+    char iface[32];
+    __u32 ifindex;
+    __u8 my_mac[6];
+    __u8 peer_mac[6];
+    char peer_ip[32];
+    int active;  // For future health check
+};
 
 struct tunnel_config {
     char local_iface[32];
@@ -35,63 +43,123 @@ struct tunnel_config {
     __u32 remote_net;
     __u32 remote_mask;
     int nwan;
-    struct {
-        char iface[32];
-        __u32 ifindex;
-        __u8 my_mac[6];
-        __u8 peer_mac[6];
-        char peer_ip[32];
-    } wan[MAX_WAN];
+    struct wan_info wan[MAX_WAN];
 };
 
-static struct tunnel_config cfg;
+struct bpf_context {
+    struct bpf_object *obj;
+    int config_fd;
+    int macs_fd;
+    int arp_fd;
+    int tx_fd;
+    int rx_fd;
+};
 
-void handle_signal(int sig) { running = 0; }
+// ==================== Global State ====================
 
-int get_mac(const char *iface, __u8 *mac) {
+static volatile int g_running = 1;
+static struct tunnel_config g_cfg = {0};
+static struct bpf_context g_bpf = {0};
+
+// ==================== Signal Handler ====================
+
+void handle_signal(int sig) {
+    (void)sig;
+    g_running = 0;
+}
+
+// ==================== MAC Utilities ====================
+
+int get_iface_mac(const char *iface, __u8 *mac) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
+
     struct ifreq ifr = {0};
     strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
     int ret = ioctl(fd, SIOCGIFHWADDR, &ifr);
     close(fd);
+
     if (ret < 0) return -1;
     memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
     return 0;
 }
 
-int get_peer_mac(const char *iface, const char *peer_ip, __u8 *mac) {
+int resolve_peer_mac(const char *iface, const char *peer_ip, __u8 *mac) {
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "ping -c 1 -W 1 -I %s %s >/dev/null 2>&1", iface, peer_ip);
     system(cmd);
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
+
     struct arpreq req = {0};
     struct sockaddr_in *sin = (struct sockaddr_in *)&req.arp_pa;
     sin->sin_family = AF_INET;
     inet_pton(AF_INET, peer_ip, &sin->sin_addr);
     strncpy(req.arp_dev, iface, sizeof(req.arp_dev) - 1);
+
     int ret = ioctl(fd, SIOCGARP, &req);
     close(fd);
+
     if (ret < 0) return -1;
     memcpy(mac, req.arp_ha.sa_data, 6);
     return 0;
 }
 
-__u64 mac_to_u64(__u8 *mac) {
+__u64 mac_to_u64(const __u8 *mac) {
     return ((__u64)mac[0]) | ((__u64)mac[1] << 8) | ((__u64)mac[2] << 16) |
            ((__u64)mac[3] << 24) | ((__u64)mac[4] << 32) | ((__u64)mac[5] << 40);
 }
 
-int parse_cidr(const char *s, __u32 *ip, __u32 *mask) {
+void print_mac(const __u8 *mac) {
+    printf("%02x:%02x:%02x:%02x:%02x:%02x",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+// ==================== Config Parser ====================
+
+static int parse_cidr(const char *s, __u32 *ip, __u32 *mask) {
     char buf[64];
     strncpy(buf, s, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
     char *slash = strchr(buf, '/');
     int prefix = 24;
-    if (slash) { *slash = 0; prefix = atoi(slash + 1); }
+    if (slash) {
+        *slash = '\0';
+        prefix = atoi(slash + 1);
+    }
+
     *ip = ntohl(inet_addr(buf));
     *mask = prefix ? (0xFFFFFFFF << (32 - prefix)) : 0;
+    return 0;
+}
+
+static int parse_local(const char *val) {
+    strncpy(g_cfg.local_iface, val, sizeof(g_cfg.local_iface) - 1);
+    g_cfg.local_ifindex = if_nametoindex(val);
+    return get_iface_mac(val, g_cfg.local_mac);
+}
+
+static int parse_remote(const char *val) {
+    return parse_cidr(val, &g_cfg.remote_net, &g_cfg.remote_mask);
+}
+
+static int parse_wan(const char *iface, const char *peer_ip) {
+    if (g_cfg.nwan >= MAX_WAN) return -1;
+
+    struct wan_info *wan = &g_cfg.wan[g_cfg.nwan];
+    strncpy(wan->iface, iface, sizeof(wan->iface) - 1);
+    wan->ifindex = if_nametoindex(iface);
+    wan->active = 1;
+    get_iface_mac(iface, wan->my_mac);
+
+    if (peer_ip && strlen(peer_ip) > 0) {
+        strncpy(wan->peer_ip, peer_ip, sizeof(wan->peer_ip) - 1);
+        resolve_peer_mac(iface, peer_ip, wan->peer_mac);
+    }
+
+    g_cfg.nwan++;
     return 0;
 }
 
@@ -103,82 +171,248 @@ int load_config(const char *path) {
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
 
-        char key[32], val1[64], val2[64];
+        char key[32], val1[64], val2[64] = {0};
         int n = sscanf(line, "%31s %63s %63s", key, val1, val2);
         if (n < 2) continue;
 
         if (!strcmp(key, "local")) {
-            strncpy(cfg.local_iface, val1, sizeof(cfg.local_iface) - 1);
-            cfg.local_ifindex = if_nametoindex(val1);
-            get_mac(val1, cfg.local_mac);
-        }
-        else if (!strcmp(key, "remote")) {
-            parse_cidr(val1, &cfg.remote_net, &cfg.remote_mask);
-        }
-        else if (!strcmp(key, "wan") && cfg.nwan < MAX_WAN) {
-            strncpy(cfg.wan[cfg.nwan].iface, val1, sizeof(cfg.wan[cfg.nwan].iface) - 1);
-            cfg.wan[cfg.nwan].ifindex = if_nametoindex(val1);
-            get_mac(val1, cfg.wan[cfg.nwan].my_mac);
-            if (n >= 3) {
-                strncpy(cfg.wan[cfg.nwan].peer_ip, val2, sizeof(cfg.wan[cfg.nwan].peer_ip) - 1);
-                get_peer_mac(val1, val2, cfg.wan[cfg.nwan].peer_mac);
-            }
-            cfg.nwan++;
+            parse_local(val1);
+        } else if (!strcmp(key, "remote")) {
+            parse_remote(val1);
+        } else if (!strcmp(key, "wan")) {
+            parse_wan(val1, n >= 3 ? val2 : NULL);
         }
     }
+
     fclose(f);
-    return (cfg.nwan > 0) ? 0 : -1;
+    return (g_cfg.nwan > 0) ? 0 : -1;
 }
 
-void print_mac(__u8 *mac) {
-    printf("%02x:%02x:%02x:%02x:%02x:%02x",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+// ==================== Config Display ====================
+
+void print_config(void) {
+    printf("=== XDP Tunnel (TCP/UDP) ===\n");
+    printf("Local: %s (ifindex=%d)\n", g_cfg.local_iface, g_cfg.local_ifindex);
+    printf("  MAC: ");
+    print_mac(g_cfg.local_mac);
+    printf("\n");
+
+    printf("Remote: %d.%d.%d.%d/%d\n",
+           (g_cfg.remote_net >> 24) & 0xFF,
+           (g_cfg.remote_net >> 16) & 0xFF,
+           (g_cfg.remote_net >> 8) & 0xFF,
+           g_cfg.remote_net & 0xFF,
+           __builtin_popcount(g_cfg.remote_mask));
+
+    printf("WANs: %d\n", g_cfg.nwan);
+
+    for (int i = 0; i < g_cfg.nwan; i++) {
+        struct wan_info *wan = &g_cfg.wan[i];
+        printf("[WAN %d] %s (ifindex=%d)\n", i, wan->iface, wan->ifindex);
+        printf("  My MAC:   ");
+        print_mac(wan->my_mac);
+        printf("\n");
+        printf("  Peer IP:  %s\n", wan->peer_ip);
+        printf("  Peer MAC: ");
+        print_mac(wan->peer_mac);
+        printf("\n");
+    }
 }
 
-void detach_all() {
-    if (cfg.local_ifindex > 0)
-        bpf_xdp_detach(cfg.local_ifindex, 0, NULL);
-    for (int i = 0; i < cfg.nwan; i++)
-        if (cfg.wan[i].ifindex > 0)
-            bpf_xdp_detach(cfg.wan[i].ifindex, 0, NULL);
+// ==================== BPF Loading ====================
+
+int bpf_load_object(const char *bpf_file) {
+    g_bpf.obj = bpf_object__open_file(bpf_file, NULL);
+    if (libbpf_get_error(g_bpf.obj)) {
+        fprintf(stderr, "Error: Failed to open %s\n", bpf_file);
+        return -1;
+    }
+
+    if (bpf_object__load(g_bpf.obj)) {
+        fprintf(stderr, "Error: Failed to load BPF object\n");
+        bpf_object__close(g_bpf.obj);
+        g_bpf.obj = NULL;
+        return -1;
+    }
+
+    return 0;
 }
 
-void *arp_thread(void *arg) {
-    int arp_fd = bpf_object__find_map_fd_by_name(obj, "arp_cache");
-    if (arp_fd < 0) return NULL;
+int bpf_find_maps(void) {
+    g_bpf.config_fd = bpf_object__find_map_fd_by_name(g_bpf.obj, "config");
+    g_bpf.macs_fd = bpf_object__find_map_fd_by_name(g_bpf.obj, "macs");
+    g_bpf.arp_fd = bpf_object__find_map_fd_by_name(g_bpf.obj, "arp_cache");
 
-    while (running) {
+    if (g_bpf.config_fd < 0) {
+        fprintf(stderr, "Error: config map not found\n");
+        return -1;
+    }
+    if (g_bpf.macs_fd < 0) {
+        fprintf(stderr, "Error: macs map not found\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+int bpf_find_programs(void) {
+    struct bpf_program *tx_prog = bpf_object__find_program_by_name(g_bpf.obj, "xdp_tx");
+    struct bpf_program *rx_prog = bpf_object__find_program_by_name(g_bpf.obj, "xdp_rx");
+
+    if (!tx_prog || !rx_prog) {
+        fprintf(stderr, "Error: XDP programs not found\n");
+        return -1;
+    }
+
+    g_bpf.tx_fd = bpf_program__fd(tx_prog);
+    g_bpf.rx_fd = bpf_program__fd(rx_prog);
+
+    return 0;
+}
+
+// ==================== BPF Map Population ====================
+
+int populate_config_map(void) {
+    __u32 key, val;
+
+    key = 0; val = g_cfg.nwan;
+    bpf_map_update_elem(g_bpf.config_fd, &key, &val, BPF_ANY);
+
+    key = 1; val = g_cfg.remote_net;
+    bpf_map_update_elem(g_bpf.config_fd, &key, &val, BPF_ANY);
+
+    key = 2; val = g_cfg.remote_mask;
+    bpf_map_update_elem(g_bpf.config_fd, &key, &val, BPF_ANY);
+
+    key = 3; val = g_cfg.local_ifindex;
+    bpf_map_update_elem(g_bpf.config_fd, &key, &val, BPF_ANY);
+
+    for (int i = 0; i < g_cfg.nwan; i++) {
+        key = 4 + i;
+        val = g_cfg.wan[i].ifindex;
+        bpf_map_update_elem(g_bpf.config_fd, &key, &val, BPF_ANY);
+    }
+
+    return 0;
+}
+
+int populate_macs_map(void) {
+    __u32 key;
+    __u64 mac_val;
+
+    // WAN source MACs (0, 1, 2)
+    for (int i = 0; i < g_cfg.nwan; i++) {
+        key = i;
+        mac_val = mac_to_u64(g_cfg.wan[i].my_mac);
+        bpf_map_update_elem(g_bpf.macs_fd, &key, &mac_val, BPF_ANY);
+    }
+
+    // WAN dest MACs (3, 4, 5)
+    for (int i = 0; i < g_cfg.nwan; i++) {
+        key = i + MAX_WAN;
+        mac_val = mac_to_u64(g_cfg.wan[i].peer_mac);
+        bpf_map_update_elem(g_bpf.macs_fd, &key, &mac_val, BPF_ANY);
+    }
+
+    // Local MAC (6)
+    key = 6;
+    mac_val = mac_to_u64(g_cfg.local_mac);
+    bpf_map_update_elem(g_bpf.macs_fd, &key, &mac_val, BPF_ANY);
+
+    return 0;
+}
+
+// ==================== XDP Attach/Detach ====================
+
+void xdp_detach_all(void) {
+    if (g_cfg.local_ifindex > 0)
+        bpf_xdp_detach(g_cfg.local_ifindex, 0, NULL);
+
+    for (int i = 0; i < g_cfg.nwan; i++) {
+        if (g_cfg.wan[i].ifindex > 0)
+            bpf_xdp_detach(g_cfg.wan[i].ifindex, 0, NULL);
+    }
+}
+
+int xdp_attach_local(void) {
+    if (bpf_xdp_attach(g_cfg.local_ifindex, g_bpf.tx_fd, 0, NULL) < 0) {
+        fprintf(stderr, "Error: Failed to attach to %s: %s\n",
+                g_cfg.local_iface, strerror(errno));
+        return -1;
+    }
+    printf("Attached TX to %s\n", g_cfg.local_iface);
+    return 0;
+}
+
+int xdp_attach_wans(void) {
+    for (int i = 0; i < g_cfg.nwan; i++) {
+        if (bpf_xdp_attach(g_cfg.wan[i].ifindex, g_bpf.rx_fd, 0, NULL) < 0) {
+            fprintf(stderr, "Error: Failed to attach to %s: %s\n",
+                    g_cfg.wan[i].iface, strerror(errno));
+            return -1;
+        }
+        printf("Attached RX to %s\n", g_cfg.wan[i].iface);
+    }
+    return 0;
+}
+
+// ==================== ARP Thread ====================
+
+void *arp_update_thread(void *arg) {
+    (void)arg;
+
+    if (g_bpf.arp_fd < 0) return NULL;
+
+    while (g_running) {
         FILE *fp = fopen("/proc/net/arp", "r");
-        if (!fp) { sleep(2); continue; }
+        if (!fp) {
+            sleep(2);
+            continue;
+        }
 
         char line[256];
-        fgets(line, sizeof(line), fp);
+        fgets(line, sizeof(line), fp);  // Skip header
 
         while (fgets(line, sizeof(line), fp)) {
             char ip_str[32], hw[16], flags[16], mac_str[32], mask[16], iface[32];
+
             if (sscanf(line, "%31s %15s %15s %31s %15s %31s",
-                      ip_str, hw, flags, mac_str, mask, iface) != 6)
+                       ip_str, hw, flags, mac_str, mask, iface) != 6)
                 continue;
 
             int f = (int)strtol(flags, NULL, 16);
             if (!(f & 0x02)) continue;
-            if (strcmp(iface, cfg.local_iface) != 0) continue;
+            if (strcmp(iface, g_cfg.local_iface) != 0) continue;
 
             __u32 ip = ntohl(inet_addr(ip_str));
             unsigned int mb[6];
             if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
-                      &mb[0], &mb[1], &mb[2], &mb[3], &mb[4], &mb[5]) == 6) {
+                       &mb[0], &mb[1], &mb[2], &mb[3], &mb[4], &mb[5]) == 6) {
                 __u64 mac = 0;
                 for (int i = 0; i < 6; i++)
                     mac |= ((__u64)mb[i]) << (i * 8);
-                bpf_map_update_elem(arp_fd, &ip, &mac, BPF_ANY);
+                bpf_map_update_elem(g_bpf.arp_fd, &ip, &mac, BPF_ANY);
             }
         }
+
         fclose(fp);
         sleep(2);
     }
+
     return NULL;
 }
+
+// ==================== Cleanup ====================
+
+void cleanup(void) {
+    xdp_detach_all();
+    if (g_bpf.obj) {
+        bpf_object__close(g_bpf.obj);
+        g_bpf.obj = NULL;
+    }
+}
+
+// ==================== Main ====================
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -186,131 +420,61 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    const char *config_file = argv[1];
     const char *bpf_file = (argc >= 3) ? argv[2] : "./tunnel.bpf.o";
 
+    // Setup signal handlers
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    if (load_config(argv[1]) < 0) {
-        fprintf(stderr, "Error: Failed to load config: %s\n", argv[1]);
+    // Load configuration
+    if (load_config(config_file) < 0) {
+        fprintf(stderr, "Error: Failed to load config: %s\n", config_file);
+        return 1;
+    }
+    print_config();
+
+    // Load BPF object
+    if (bpf_load_object(bpf_file) < 0) {
         return 1;
     }
 
-    printf("=== XDP Tunnel (TCP/UDP) ===\n");
-    printf("Local: %s (ifindex=%d)\n", cfg.local_iface, cfg.local_ifindex);
-    printf("  MAC: "); print_mac(cfg.local_mac); printf("\n");
-    printf("Remote: %d.%d.%d.%d/%d\n",
-           (cfg.remote_net >> 24) & 0xFF, (cfg.remote_net >> 16) & 0xFF,
-           (cfg.remote_net >> 8) & 0xFF, cfg.remote_net & 0xFF,
-           __builtin_popcount(cfg.remote_mask));
-    printf("WANs: %d\n", cfg.nwan);
-
-    for (int i = 0; i < cfg.nwan; i++) {
-        printf("[WAN %d] %s (ifindex=%d)\n", i, cfg.wan[i].iface, cfg.wan[i].ifindex);
-        printf("  My MAC:   "); print_mac(cfg.wan[i].my_mac); printf("\n");
-        printf("  Peer IP:  %s\n", cfg.wan[i].peer_ip);
-        printf("  Peer MAC: "); print_mac(cfg.wan[i].peer_mac); printf("\n");
-    }
-
-    obj = bpf_object__open_file(bpf_file, NULL);
-    if (libbpf_get_error(obj)) {
-        fprintf(stderr, "Error: Failed to open %s\n", bpf_file);
+    // Find maps and programs
+    if (bpf_find_maps() < 0 || bpf_find_programs() < 0) {
+        cleanup();
         return 1;
     }
 
-    if (bpf_object__load(obj)) {
-        fprintf(stderr, "Error: Failed to load BPF object\n");
-        bpf_object__close(obj);
+    // Populate maps
+    populate_config_map();
+    populate_macs_map();
+
+    // Attach XDP programs
+    if (xdp_attach_local() < 0) {
+        cleanup();
         return 1;
     }
 
-    int config_fd = bpf_object__find_map_fd_by_name(obj, "config");
-    if (config_fd < 0) {
-        fprintf(stderr, "Error: config map not found\n");
-        bpf_object__close(obj);
+    if (xdp_attach_wans() < 0) {
+        cleanup();
         return 1;
     }
 
-    __u32 key, val;
-    key = 0; val = cfg.nwan;
-    bpf_map_update_elem(config_fd, &key, &val, BPF_ANY);
-    key = 1; val = cfg.remote_net;
-    bpf_map_update_elem(config_fd, &key, &val, BPF_ANY);
-    key = 2; val = cfg.remote_mask;
-    bpf_map_update_elem(config_fd, &key, &val, BPF_ANY);
-    key = 3; val = cfg.local_ifindex;
-    bpf_map_update_elem(config_fd, &key, &val, BPF_ANY);
-
-    for (int i = 0; i < cfg.nwan; i++) {
-        key = 4 + i;
-        val = cfg.wan[i].ifindex;
-        bpf_map_update_elem(config_fd, &key, &val, BPF_ANY);
-    }
-
-    int macs_fd = bpf_object__find_map_fd_by_name(obj, "macs");
-    if (macs_fd < 0) {
-        fprintf(stderr, "Error: macs map not found\n");
-        bpf_object__close(obj);
-        return 1;
-    }
-
-    __u64 mac_val;
-    for (int i = 0; i < cfg.nwan; i++) {
-        key = i;
-        mac_val = mac_to_u64(cfg.wan[i].my_mac);
-        bpf_map_update_elem(macs_fd, &key, &mac_val, BPF_ANY);
-    }
-    for (int i = 0; i < cfg.nwan; i++) {
-        key = i + MAX_WAN;
-        mac_val = mac_to_u64(cfg.wan[i].peer_mac);
-        bpf_map_update_elem(macs_fd, &key, &mac_val, BPF_ANY);
-    }
-    key = 6;
-    mac_val = mac_to_u64(cfg.local_mac);
-    bpf_map_update_elem(macs_fd, &key, &mac_val, BPF_ANY);
-
-    struct bpf_program *tx_prog = bpf_object__find_program_by_name(obj, "xdp_tx");
-    struct bpf_program *rx_prog = bpf_object__find_program_by_name(obj, "xdp_rx");
-
-    if (!tx_prog || !rx_prog) {
-        fprintf(stderr, "Error: XDP programs not found\n");
-        bpf_object__close(obj);
-        return 1;
-    }
-
-    int tx_fd = bpf_program__fd(tx_prog);
-    int rx_fd = bpf_program__fd(rx_prog);
-
-    if (bpf_xdp_attach(cfg.local_ifindex, tx_fd, 0, NULL) < 0) {
-        fprintf(stderr, "Error: Failed to attach to %s: %s\n",
-                cfg.local_iface, strerror(errno));
-        bpf_object__close(obj);
-        return 1;
-    }
-    printf("Attached TX to %s\n", cfg.local_iface);
-
-    for (int i = 0; i < cfg.nwan; i++) {
-        if (bpf_xdp_attach(cfg.wan[i].ifindex, rx_fd, 0, NULL) < 0) {
-            fprintf(stderr, "Error: Failed to attach to %s: %s\n",
-                    cfg.wan[i].iface, strerror(errno));
-            detach_all();
-            bpf_object__close(obj);
-            return 1;
-        }
-        printf("Attached RX to %s\n", cfg.wan[i].iface);
-    }
-
+    // Start ARP update thread
     pthread_t arp_tid;
-    pthread_create(&arp_tid, NULL, arp_thread, NULL);
+    pthread_create(&arp_tid, NULL, arp_update_thread, NULL);
 
     printf("\nXDP Tunnel (TCP/UDP) running. Ctrl+C to stop.\n");
 
-    while (running) sleep(1);
+    // Main loop
+    while (g_running) {
+        sleep(1);
+    }
 
+    // Shutdown
     printf("\nShutting down...\n");
     pthread_join(arp_tid, NULL);
-    detach_all();
-    bpf_object__close(obj);
+    cleanup();
     printf("Done.\n");
 
     return 0;
