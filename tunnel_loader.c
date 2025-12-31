@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// XDP Tunnel Loader - TCP/UDP (Refactored)
+// XDP Tunnel Loader - TCP/UDP with WAN Health Check (Netlink)
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +15,8 @@
 #include <arpa/inet.h>
 #include <linux/if_arp.h>
 #include <linux/if_link.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
@@ -33,7 +35,7 @@ struct wan_info {
     __u8 my_mac[6];
     __u8 peer_mac[6];
     char peer_ip[32];
-    int active;  // For future health check
+    int active;
 };
 
 struct tunnel_config {
@@ -51,6 +53,7 @@ struct bpf_context {
     int config_fd;
     int macs_fd;
     int arp_fd;
+    int wan_status_fd;
     int tx_fd;
     int rx_fd;
 };
@@ -191,7 +194,7 @@ int load_config(const char *path) {
 // ==================== Config Display ====================
 
 void print_config(void) {
-    printf("=== XDP Tunnel (TCP/UDP) ===\n");
+    printf("=== XDP Tunnel (TCP/UDP) with Health Check ===\n");
     printf("Local: %s (ifindex=%d)\n", g_cfg.local_iface, g_cfg.local_ifindex);
     printf("  MAC: ");
     print_mac(g_cfg.local_mac);
@@ -242,6 +245,7 @@ int bpf_find_maps(void) {
     g_bpf.config_fd = bpf_object__find_map_fd_by_name(g_bpf.obj, "config");
     g_bpf.macs_fd = bpf_object__find_map_fd_by_name(g_bpf.obj, "macs");
     g_bpf.arp_fd = bpf_object__find_map_fd_by_name(g_bpf.obj, "arp_cache");
+    g_bpf.wan_status_fd = bpf_object__find_map_fd_by_name(g_bpf.obj, "wan_status");
 
     if (g_bpf.config_fd < 0) {
         fprintf(stderr, "Error: config map not found\n");
@@ -249,6 +253,10 @@ int bpf_find_maps(void) {
     }
     if (g_bpf.macs_fd < 0) {
         fprintf(stderr, "Error: macs map not found\n");
+        return -1;
+    }
+    if (g_bpf.wan_status_fd < 0) {
+        fprintf(stderr, "Error: wan_status map not found\n");
         return -1;
     }
 
@@ -300,26 +308,140 @@ int populate_macs_map(void) {
     __u32 key;
     __u64 mac_val;
 
-    // WAN source MACs (0, 1, 2)
     for (int i = 0; i < g_cfg.nwan; i++) {
         key = i;
         mac_val = mac_to_u64(g_cfg.wan[i].my_mac);
         bpf_map_update_elem(g_bpf.macs_fd, &key, &mac_val, BPF_ANY);
     }
 
-    // WAN dest MACs (3, 4, 5)
     for (int i = 0; i < g_cfg.nwan; i++) {
         key = i + MAX_WAN;
         mac_val = mac_to_u64(g_cfg.wan[i].peer_mac);
         bpf_map_update_elem(g_bpf.macs_fd, &key, &mac_val, BPF_ANY);
     }
 
-    // Local MAC (6)
     key = 6;
     mac_val = mac_to_u64(g_cfg.local_mac);
     bpf_map_update_elem(g_bpf.macs_fd, &key, &mac_val, BPF_ANY);
 
     return 0;
+}
+
+// ==================== WAN Status Management ====================
+
+void update_wan_status(int wan_idx, int active) {
+    if (wan_idx < 0 || wan_idx >= g_cfg.nwan) return;
+
+    __u32 key = wan_idx;
+    __u32 val = active ? 1 : 0;
+
+    g_cfg.wan[wan_idx].active = active;
+    bpf_map_update_elem(g_bpf.wan_status_fd, &key, &val, BPF_ANY);
+
+    printf("[HEALTH] WAN %d (%s): %s\n",
+           wan_idx, g_cfg.wan[wan_idx].iface,
+           active ? "UP" : "DOWN");
+}
+
+void init_wan_status(void) {
+    for (int i = 0; i < g_cfg.nwan; i++) {
+        update_wan_status(i, 1);  // All WANs start as active
+    }
+}
+
+int find_wan_by_ifindex(__u32 ifindex) {
+    for (int i = 0; i < g_cfg.nwan; i++) {
+        if (g_cfg.wan[i].ifindex == ifindex)
+            return i;
+    }
+    return -1;
+}
+
+// ==================== Netlink Monitor ====================
+
+int create_netlink_socket(void) {
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if (fd < 0) {
+        perror("socket(NETLINK_ROUTE)");
+        return -1;
+    }
+
+    struct sockaddr_nl addr = {0};
+    addr.nl_family = AF_NETLINK;
+    addr.nl_groups = RTMGRP_LINK;
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind(netlink)");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+void process_netlink_message(struct nlmsghdr *nlh) {
+    if (nlh->nlmsg_type != RTM_NEWLINK && nlh->nlmsg_type != RTM_DELLINK)
+        return;
+
+    struct ifinfomsg *ifi = NLMSG_DATA(nlh);
+    int ifindex = ifi->ifi_index;
+
+    int wan_idx = find_wan_by_ifindex(ifindex);
+    if (wan_idx < 0)
+        return;  // Not our WAN interface
+
+    // Check interface flags
+    int is_up = (ifi->ifi_flags & IFF_UP) && (ifi->ifi_flags & IFF_RUNNING);
+    int was_active = g_cfg.wan[wan_idx].active;
+
+    if (is_up && !was_active) {
+        update_wan_status(wan_idx, 1);
+    } else if (!is_up && was_active) {
+        update_wan_status(wan_idx, 0);
+    }
+}
+
+void *netlink_monitor_thread(void *arg) {
+    (void)arg;
+
+    int nl_fd = create_netlink_socket();
+    if (nl_fd < 0) {
+        fprintf(stderr, "Error: Failed to create netlink socket\n");
+        return NULL;
+    }
+
+    printf("[HEALTH] Netlink monitor started\n");
+
+    char buf[4096];
+    while (g_running) {
+        struct timeval tv = {1, 0};  // 1 second timeout
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(nl_fd, &fds);
+
+        int ret = select(nl_fd + 1, &fds, NULL, NULL, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (ret == 0) continue;  // Timeout
+
+        ssize_t len = recv(nl_fd, buf, sizeof(buf), 0);
+        if (len < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+        while (NLMSG_OK(nlh, len)) {
+            process_netlink_message(nlh);
+            nlh = NLMSG_NEXT(nlh, len);
+        }
+    }
+
+    close(nl_fd);
+    printf("[HEALTH] Netlink monitor stopped\n");
+    return NULL;
 }
 
 // ==================== XDP Attach/Detach ====================
@@ -371,7 +493,7 @@ void *arp_update_thread(void *arg) {
         }
 
         char line[256];
-        fgets(line, sizeof(line), fp);  // Skip header
+        fgets(line, sizeof(line), fp);
 
         while (fgets(line, sizeof(line), fp)) {
             char ip_str[32], hw[16], flags[16], mac_str[32], mask[16], iface[32];
@@ -423,33 +545,28 @@ int main(int argc, char **argv) {
     const char *config_file = argv[1];
     const char *bpf_file = (argc >= 3) ? argv[2] : "./tunnel.bpf.o";
 
-    // Setup signal handlers
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    // Load configuration
     if (load_config(config_file) < 0) {
         fprintf(stderr, "Error: Failed to load config: %s\n", config_file);
         return 1;
     }
     print_config();
 
-    // Load BPF object
     if (bpf_load_object(bpf_file) < 0) {
         return 1;
     }
 
-    // Find maps and programs
     if (bpf_find_maps() < 0 || bpf_find_programs() < 0) {
         cleanup();
         return 1;
     }
 
-    // Populate maps
     populate_config_map();
     populate_macs_map();
+    init_wan_status();
 
-    // Attach XDP programs
     if (xdp_attach_local() < 0) {
         cleanup();
         return 1;
@@ -460,20 +577,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Start ARP update thread
-    pthread_t arp_tid;
+    // Start threads
+    pthread_t arp_tid, netlink_tid;
     pthread_create(&arp_tid, NULL, arp_update_thread, NULL);
+    pthread_create(&netlink_tid, NULL, netlink_monitor_thread, NULL);
 
-    printf("\nXDP Tunnel (TCP/UDP) running. Ctrl+C to stop.\n");
+    printf("\nXDP Tunnel running. Ctrl+C to stop.\n");
+    printf("Health check: Netlink monitoring active\n\n");
 
-    // Main loop
     while (g_running) {
         sleep(1);
     }
 
-    // Shutdown
     printf("\nShutting down...\n");
     pthread_join(arp_tid, NULL);
+    pthread_join(netlink_tid, NULL);
     cleanup();
     printf("Done.\n");
 
