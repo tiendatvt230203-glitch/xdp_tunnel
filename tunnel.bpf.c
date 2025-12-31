@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// XDP Tunnel - TCP/UDP Load Balancer (round-robin)
+// XDP Tunnel - TCP/UDP Load Balancer with WAN Health Check
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
@@ -27,6 +27,14 @@ struct {
     __type(value, __u64);
 } macs SEC(".maps");
 
+// WAN status: 0=down, 1=up
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_WAN);
+    __type(key, __u32);
+    __type(value, __u32);
+} wan_status SEC(".maps");
+
 // ARP cache for local network
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -45,7 +53,27 @@ static __always_inline void mac_copy(__u8 *dst, __u64 mac)
     dst[5] = mac >> 40;
 }
 
-// ==================== TX: Local -> WAN (round-robin) ====================
+// Find next active WAN using round-robin, skip down WANs
+static __always_inline int find_active_wan(__u32 start_idx, __u32 nwan)
+{
+    __u32 idx = start_idx;
+
+    #pragma unroll
+    for (int i = 0; i < MAX_WAN; i++) {
+        if (idx >= nwan)
+            idx = 0;
+
+        __u32 *status = bpf_map_lookup_elem(&wan_status, &idx);
+        if (status && *status == 1)
+            return idx;
+
+        idx++;
+    }
+
+    return -1;  // No active WAN
+}
+
+// ==================== TX: Local -> WAN (round-robin with health check) ====================
 SEC("xdp_local")
 int xdp_tx(struct xdp_md *ctx)
 {
@@ -81,20 +109,25 @@ int xdp_tx(struct xdp_md *ctx)
     if ((dst_ip & *remote_mask) != (*remote_net & *remote_mask))
         return XDP_PASS;
 
-    // Round-robin using IP ID
-    __u32 wan_idx = bpf_ntohs(ip->id) % *nwan;
-    if (wan_idx >= MAX_WAN)
-        wan_idx = 0;
+    // Round-robin starting point
+    __u32 start_idx = bpf_ntohs(ip->id) % *nwan;
+
+    // Find active WAN (skip down WANs)
+    int wan_idx = find_active_wan(start_idx, *nwan);
+    if (wan_idx < 0)
+        return XDP_PASS;  // No active WAN, let kernel handle
+
+    __u32 idx = wan_idx;
 
     // Get WAN ifindex
-    __u32 if_key = 4 + wan_idx;
+    __u32 if_key = 4 + idx;
     __u32 *wan_if = bpf_map_lookup_elem(&config, &if_key);
     if (!wan_if || *wan_if == 0)
         return XDP_PASS;
 
     // Get MACs
-    __u64 *src_mac = bpf_map_lookup_elem(&macs, &wan_idx);
-    __u32 dst_key = wan_idx + MAX_WAN;
+    __u64 *src_mac = bpf_map_lookup_elem(&macs, &idx);
+    __u32 dst_key = idx + MAX_WAN;
     __u64 *dst_mac = bpf_map_lookup_elem(&macs, &dst_key);
 
     if (!src_mac || !dst_mac)
