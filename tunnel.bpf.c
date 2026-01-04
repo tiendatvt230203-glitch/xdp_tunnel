@@ -74,7 +74,7 @@ static __always_inline int find_active_wan(__u32 start_idx, __u32 nwan)
 }
 
 // ==================== TX: Local -> WAN (round-robin with health check) ====================
-SEC("xdp_local")
+SEC("xdp")
 int xdp_tx(struct xdp_md *ctx)
 {
     void *data = (void *)(long)ctx->data;
@@ -140,7 +140,7 @@ int xdp_tx(struct xdp_md *ctx)
 }
 
 // ==================== RX: WAN -> Local ====================
-SEC("xdp_wan")
+SEC("xdp")
 int xdp_rx(struct xdp_md *ctx)
 {
     void *data = (void *)(long)ctx->data;

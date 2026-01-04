@@ -20,11 +20,6 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
-#ifndef bpf_xdp_attach
-#define bpf_xdp_attach(ifindex, fd, flags, opts) bpf_set_link_xdp_fd(ifindex, fd, flags)
-#define bpf_xdp_detach(ifindex, flags, opts) bpf_set_link_xdp_fd(ifindex, -1, flags)
-#endif
-
 #define MAX_WAN 3
 
 // ==================== Data Structures ====================
