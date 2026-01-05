@@ -9,8 +9,7 @@
 #include <bpf/bpf_endian.h>
 
 #define MAX_WAN 3
-#define CTRL_PORT 9999
-#define CHUNK_SHIFT 16
+#define CHUNK_SHIFT 16  // 64KB per chunk
 
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 16); __type(key, __u32); __type(value, __u32); } config SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 8); __type(key, __u32); __type(value, __u64); } macs SEC(".maps");
@@ -28,13 +27,6 @@ int xdp_tx(struct xdp_md *ctx) {
 
     struct iphdr *ip = (void*)(eth+1);
     if ((void*)(ip+1) > end) return XDP_PASS;
-
-    if (ip->protocol == IPPROTO_UDP) {
-        struct udphdr *udp = (void*)ip + (ip->ihl*4);
-        if ((void*)(udp+1) > end) return XDP_PASS;
-        __u16 sp = bpf_ntohs(udp->source), dp = bpf_ntohs(udp->dest);
-        if (sp == CTRL_PORT || dp == CTRL_PORT) return XDP_PASS;
-    }
     if (ip->protocol != IPPROTO_TCP && ip->protocol != IPPROTO_UDP) return XDP_PASS;
 
     __u32 k=0; __u32 *nwan = bpf_map_lookup_elem(&config, &k);
@@ -70,13 +62,6 @@ int xdp_rx(struct xdp_md *ctx) {
 
     struct iphdr *ip = (void*)(eth+1);
     if ((void*)(ip+1) > end) return XDP_PASS;
-
-    if (ip->protocol == IPPROTO_UDP) {
-        struct udphdr *udp = (void*)ip + (ip->ihl*4);
-        if ((void*)(udp+1) > end) return XDP_PASS;
-        __u16 sp = bpf_ntohs(udp->source), dp = bpf_ntohs(udp->dest);
-        if (sp == CTRL_PORT || dp == CTRL_PORT) return XDP_PASS;
-    }
     if (ip->protocol != IPPROTO_TCP && ip->protocol != IPPROTO_UDP) return XDP_PASS;
 
     __u32 k=1; __u32 *rnet = bpf_map_lookup_elem(&config, &k);
@@ -90,8 +75,8 @@ int xdp_rx(struct xdp_md *ctx) {
 
     set_mac(eth->h_source, *lmac);
     __u32 dip = bpf_ntohl(ip->daddr);
-    __u64 *dmac = bpf_map_lookup_elem(&arp_cache, &dip);
-    if (dmac) set_mac(eth->h_dest, *dmac);
+    __u64 *dm = bpf_map_lookup_elem(&arp_cache, &dip);
+    if (dm) set_mac(eth->h_dest, *dm);
     else __builtin_memset(eth->h_dest, 0xff, 6);
 
     return bpf_redirect(*lif, 0);
