@@ -26,7 +26,7 @@
 #define HS_TO 5
 
 enum { DOWN=0, WAITING, CONFIRMED, UP };
-enum { MSG_DOWN=0, MSG_READY, MSG_CONFIRM, MSG_ACTIVE };
+enum { XMSG_DOWN=0, XMSG_READY, XMSG_CONFIRM, XMSG_ACTIVE };
 
 struct wan_t {
     char iface[32], peer[32], myip[32];
@@ -51,7 +51,7 @@ static int pfd[2], sock = -1;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void sig(int s) { (void)s; run = 0; }
-static void reload(void) { write(pfd[1], "R", 1); }
+static void reload(void) { (void)write(pfd[1], "R", 1); }
 static __u64 m2u(const __u8 *m) { return (__u64)m[0]|((__u64)m[1]<<8)|((__u64)m[2]<<16)|((__u64)m[3]<<24)|((__u64)m[4]<<32)|((__u64)m[5]<<40); }
 
 static int getmac(const char *f, __u8 *m) {
@@ -171,7 +171,7 @@ static int loadcfg(const char *p) {
     fclose(f); return C.nwan > 0 ? 0 : -1;
 }
 
-static void sendmsg(int i, int type) {
+static void send_ctrl(int i, int type) {
     struct msg_t m = {{'X','D','P','C'}, type}; strncpy(m.ip, C.wan[i].peer, sizeof(m.ip)-1);
     for (int j=0; j<C.nwan; j++) {
         if (C.wan[j].state != UP || !C.wan[j].peer[0]) continue;
@@ -179,7 +179,7 @@ static void sendmsg(int i, int type) {
         inet_pton(AF_INET, C.wan[j].peer, &a.sin_addr);
         sendto(sock, &m, sizeof(m), 0, (struct sockaddr*)&a, sizeof(a));
     }
-    if (type != MSG_DOWN && C.wan[i].peer[0]) {
+    if (type != XMSG_DOWN && C.wan[i].peer[0]) {
         struct sockaddr_in a = {.sin_family=AF_INET, .sin_port=htons(CTRL_PORT)};
         inet_pton(AF_INET, C.wan[i].peer, &a.sin_addr);
         sendto(sock, &m, sizeof(m), 0, (struct sockaddr*)&a, sizeof(a));
@@ -191,22 +191,22 @@ static void h_down(int i) { if (C.wan[i].state==DOWN) return; C.wan[i].state=DOW
 static void h_ready(int i) {
     if (!ifup(C.wan[i].iface) || !pingok(C.wan[i].iface, C.wan[i].peer)) return;
     C.wan[i].pr = 1;
-    if (!C.wan[i].lr) { C.wan[i].lr=1; C.wan[i].state=WAITING; C.wan[i].since=time(NULL); pthread_mutex_unlock(&lock); sendmsg(i, MSG_READY); pthread_mutex_lock(&lock); }
-    if (C.wan[i].lr && C.wan[i].pr && !C.wan[i].lc) { C.wan[i].lc=1; pthread_mutex_unlock(&lock); sendmsg(i, MSG_CONFIRM); pthread_mutex_lock(&lock); }
+    if (!C.wan[i].lr) { C.wan[i].lr=1; C.wan[i].state=WAITING; C.wan[i].since=time(NULL); pthread_mutex_unlock(&lock); send_ctrl(i, XMSG_READY); pthread_mutex_lock(&lock); }
+    if (C.wan[i].lr && C.wan[i].pr && !C.wan[i].lc) { C.wan[i].lc=1; pthread_mutex_unlock(&lock); send_ctrl(i, XMSG_CONFIRM); pthread_mutex_lock(&lock); }
 }
 
 static void h_confirm(int i) {
     C.wan[i].pc = 1;
-    if (C.wan[i].lr && C.wan[i].pr && !C.wan[i].lc) { C.wan[i].lc=1; pthread_mutex_unlock(&lock); sendmsg(i, MSG_CONFIRM); pthread_mutex_lock(&lock); }
+    if (C.wan[i].lr && C.wan[i].pr && !C.wan[i].lc) { C.wan[i].lc=1; pthread_mutex_unlock(&lock); send_ctrl(i, XMSG_CONFIRM); pthread_mutex_lock(&lock); }
     if (C.wan[i].lc && C.wan[i].pc && C.wan[i].state!=CONFIRMED && C.wan[i].state!=UP) {
         C.wan[i].state=CONFIRMED; C.wan[i].la=1; C.wan[i].since=time(NULL);
-        pthread_mutex_unlock(&lock); sendmsg(i, MSG_ACTIVE); pthread_mutex_lock(&lock);
+        pthread_mutex_unlock(&lock); send_ctrl(i, XMSG_ACTIVE); pthread_mutex_lock(&lock);
     }
 }
 
 static void h_active(int i) {
     C.wan[i].pa = 1;
-    if (C.wan[i].lc && C.wan[i].pr && !C.wan[i].la) { C.wan[i].la=1; C.wan[i].state=CONFIRMED; pthread_mutex_unlock(&lock); sendmsg(i, MSG_ACTIVE); pthread_mutex_lock(&lock); }
+    if (C.wan[i].lc && C.wan[i].pr && !C.wan[i].la) { C.wan[i].la=1; C.wan[i].state=CONFIRMED; pthread_mutex_unlock(&lock); send_ctrl(i, XMSG_ACTIVE); pthread_mutex_lock(&lock); }
     if (C.wan[i].la && C.wan[i].pa && C.wan[i].state!=UP) { C.wan[i].state=UP; pthread_mutex_unlock(&lock); reload(); pthread_mutex_lock(&lock); }
 }
 
@@ -223,10 +223,10 @@ static void *ctrl_th(void *arg) {
         pthread_mutex_lock(&lock);
         int old = C.wan[idx].state;
         switch (m->type) {
-            case MSG_DOWN: h_down(idx); if (old!=DOWN) { pthread_mutex_unlock(&lock); reload(); pthread_mutex_lock(&lock); } break;
-            case MSG_READY: h_ready(idx); break;
-            case MSG_CONFIRM: h_confirm(idx); break;
-            case MSG_ACTIVE: h_active(idx); break;
+            case XMSG_DOWN: h_down(idx); if (old!=DOWN) { pthread_mutex_unlock(&lock); reload(); pthread_mutex_lock(&lock); } break;
+            case XMSG_READY: h_ready(idx); break;
+            case XMSG_CONFIRM: h_confirm(idx); break;
+            case XMSG_ACTIVE: h_active(idx); break;
         }
         pthread_mutex_unlock(&lock);
     }
@@ -243,19 +243,19 @@ static void *health_th(void *arg) {
             int ok = ifup(C.wan[i].iface) && pingok(C.wan[i].iface, C.wan[i].peer);
             switch (C.wan[i].state) {
                 case UP:
-                    if (!ok && ++C.wan[i].pfail >= PING_FAIL) { C.wan[i].state=DOWN; reset(i); need=1; pthread_mutex_unlock(&lock); sendmsg(i, MSG_DOWN); pthread_mutex_lock(&lock); }
+                    if (!ok && ++C.wan[i].pfail >= PING_FAIL) { C.wan[i].state=DOWN; reset(i); need=1; pthread_mutex_unlock(&lock); send_ctrl(i, XMSG_DOWN); pthread_mutex_lock(&lock); }
                     else if (ok) C.wan[i].pfail=0;
                     break;
                 case DOWN:
-                    if (ok) { C.wan[i].state=WAITING; C.wan[i].lr=1; C.wan[i].since=now; pthread_mutex_unlock(&lock); sendmsg(i, MSG_READY); pthread_mutex_lock(&lock); }
+                    if (ok) { C.wan[i].state=WAITING; C.wan[i].lr=1; C.wan[i].since=now; pthread_mutex_unlock(&lock); send_ctrl(i, XMSG_READY); pthread_mutex_lock(&lock); }
                     break;
                 case WAITING:
-                    if (!ok) { C.wan[i].state=DOWN; reset(i); need=1; pthread_mutex_unlock(&lock); sendmsg(i, MSG_DOWN); pthread_mutex_lock(&lock); }
-                    else if (now - C.wan[i].since > HS_TO) { C.wan[i].since=now; pthread_mutex_unlock(&lock); sendmsg(i, MSG_READY); pthread_mutex_lock(&lock); }
+                    if (!ok) { C.wan[i].state=DOWN; reset(i); need=1; pthread_mutex_unlock(&lock); send_ctrl(i, XMSG_DOWN); pthread_mutex_lock(&lock); }
+                    else if (now - C.wan[i].since > HS_TO) { C.wan[i].since=now; pthread_mutex_unlock(&lock); send_ctrl(i, XMSG_READY); pthread_mutex_lock(&lock); }
                     break;
                 case CONFIRMED:
-                    if (!ok) { C.wan[i].state=DOWN; reset(i); need=1; pthread_mutex_unlock(&lock); sendmsg(i, MSG_DOWN); pthread_mutex_lock(&lock); }
-                    else if (now - C.wan[i].since > HS_TO) { C.wan[i].since=now; pthread_mutex_unlock(&lock); sendmsg(i, MSG_ACTIVE); pthread_mutex_lock(&lock); }
+                    if (!ok) { C.wan[i].state=DOWN; reset(i); need=1; pthread_mutex_unlock(&lock); send_ctrl(i, XMSG_DOWN); pthread_mutex_lock(&lock); }
+                    else if (now - C.wan[i].since > HS_TO) { C.wan[i].since=now; pthread_mutex_unlock(&lock); send_ctrl(i, XMSG_ACTIVE); pthread_mutex_lock(&lock); }
                     break;
             }
         }
@@ -270,7 +270,7 @@ static void *arp_th(void *arg) {
     while (run) {
         if (B.arp < 0) { sleep(2); continue; }
         FILE *fp = fopen("/proc/net/arp", "r"); if (!fp) { sleep(2); continue; }
-        char line[256]; fgets(line, sizeof(line), fp);
+        char line[256]; (void)fgets(line, sizeof(line), fp);
         while (fgets(line, sizeof(line), fp)) {
             char ip[32], hw[16], fl[16], mac[32], msk[16], iface[32];
             if (sscanf(line, "%31s %15s %15s %31s %15s %31s", ip, hw, fl, mac, msk, iface) != 6) continue;
@@ -302,7 +302,7 @@ int main(int argc, char **argv) {
     for (int i=0; i<C.nwan; i++) {
         reset(i);
         if (ifup(C.wan[i].iface) && pingok(C.wan[i].iface, C.wan[i].peer)) {
-            C.wan[i].state=WAITING; C.wan[i].lr=1; C.wan[i].since=time(NULL); sendmsg(i, MSG_READY);
+            C.wan[i].state=WAITING; C.wan[i].lr=1; C.wan[i].since=time(NULL); send_ctrl(i, XMSG_READY);
         }
     }
     sleep(HS_TO); xdp_reload();
@@ -314,7 +314,7 @@ int main(int argc, char **argv) {
     while (run) {
         fd_set fds; FD_ZERO(&fds); FD_SET(pfd[0], &fds);
         struct timeval tv = {1, 0};
-        if (select(pfd[0]+1, &fds, NULL, NULL, &tv) > 0 && FD_ISSET(pfd[0], &fds)) { char c; read(pfd[0], &c, 1); xdp_reload(); }
+        if (select(pfd[0]+1, &fds, NULL, NULL, &tv) > 0 && FD_ISSET(pfd[0], &fds)) { char c; (void)read(pfd[0], &c, 1); xdp_reload(); }
     }
 
     pthread_join(t2, NULL); pthread_join(t3, NULL); pthread_join(t1, NULL);
