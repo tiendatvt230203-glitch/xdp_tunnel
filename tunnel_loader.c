@@ -70,9 +70,6 @@ static __u64 mac2u64(const __u8 *m) {
            ((__u64)m[3]<<24) | ((__u64)m[4]<<32) | ((__u64)m[5]<<40);
 }
 
-static void u64mac(__u8 *d, __u64 m) {
-    for(int i=0; i<6; i++) d[i] = m >> (i*8);
-}
 
 static int get_mac(const char *iface, __u8 *mac) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
