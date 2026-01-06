@@ -9,11 +9,36 @@
 #include <bpf/bpf_endian.h>
 
 #define MAX_WAN 3
-#define CHUNK_SHIFT 16  // 64KB per chunk
+#define WINDOW_SIZE 65536  // 64KB per window
 
+// Flow key (5-tuple)
+struct flow_key {
+    __u32 saddr;
+    __u32 daddr;
+    __u16 sport;
+    __u16 dport;
+};
+
+// Connection state
+struct conn_state {
+    __u32 isn;              // Initial Sequence Number
+    __u32 current_wan;      // Current WAN index
+    __u32 window_start_seq; // Sequence number at start of current window
+    __u32 bytes_in_window;  // Bytes sent in current window
+};
+
+// Maps
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 16); __type(key, __u32); __type(value, __u32); } config SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 8); __type(key, __u32); __type(value, __u64); } macs SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_LRU_HASH); __uint(max_entries, 256); __type(key, __u32); __type(value, __u64); } arp_cache SEC(".maps");
+
+// Track connection state
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10000);
+    __type(key, struct flow_key);
+    __type(value, struct conn_state);
+} conn_track SEC(".maps");
 
 static __always_inline void set_mac(__u8 *d, __u64 m) {
     d[0]=m; d[1]=m>>8; d[2]=m>>16; d[3]=m>>24; d[4]=m>>32; d[5]=m>>40;
@@ -36,11 +61,72 @@ int xdp_tx(struct xdp_md *ctx) {
     if ((bpf_ntohl(ip->daddr) & *rmask) != (*rnet & *rmask)) return XDP_PASS;
 
     __u32 idx = 0;
+
     if (ip->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = (void*)ip + (ip->ihl*4);
         if ((void*)(tcp+1) > end) return XDP_PASS;
-        idx = (bpf_ntohl(tcp->seq) >> CHUNK_SHIFT) % *nwan;
+
+        // Create flow key
+        struct flow_key fkey = {
+            .saddr = ip->saddr,
+            .daddr = ip->daddr,
+            .sport = tcp->source,
+            .dport = tcp->dest
+        };
+
+        __u32 seq = bpf_ntohl(tcp->seq);
+        __u16 payload_len = bpf_ntohs(ip->tot_len) - (ip->ihl * 4) - (tcp->doff * 4);
+
+        // Check if SYN packet (new connection)
+        if (tcp->syn && !tcp->ack) {
+            // New connection - initialize state
+            struct conn_state state = {
+                .isn = seq,
+                .current_wan = 0,  // Start with WAN0
+                .window_start_seq = seq,
+                .bytes_in_window = 0
+            };
+            bpf_map_update_elem(&conn_track, &fkey, &state, BPF_ANY);
+            idx = 0;
+        } else {
+            // Existing connection
+            struct conn_state *state = bpf_map_lookup_elem(&conn_track, &fkey);
+            if (state) {
+                // Calculate bytes from window start
+                __u32 seq_from_window_start;
+
+                // Handle sequence number wrap-around
+                if (seq >= state->window_start_seq) {
+                    seq_from_window_start = seq - state->window_start_seq;
+                } else {
+                    // Wrap-around case
+                    seq_from_window_start = (0xFFFFFFFF - state->window_start_seq) + seq + 1;
+                }
+
+                // Check if we need to move to next window
+                if (seq_from_window_start >= WINDOW_SIZE) {
+                    // Move to next WAN (round-robin)
+                    state->current_wan = (state->current_wan + 1) % *nwan;
+                    state->window_start_seq = seq;
+                    state->bytes_in_window = payload_len;
+                } else {
+                    state->bytes_in_window += payload_len;
+                }
+
+                idx = state->current_wan;
+            } else {
+                // No state found - fallback to flow hash
+                __u32 hash = fkey.saddr ^ fkey.daddr ^ ((__u32)fkey.sport << 16 | fkey.dport);
+                idx = hash % *nwan;
+            }
+        }
+
+        // Clean up on FIN/RST
+        if (tcp->fin || tcp->rst) {
+            bpf_map_delete_elem(&conn_track, &fkey);
+        }
     } else {
+        // UDP: use IP ID
         idx = bpf_ntohs(ip->id) % *nwan;
     }
 
