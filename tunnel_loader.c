@@ -1,150 +1,184 @@
-// Simple XDP Tunnel Loader - Per-window load balancing test
+// XDP Classifier Loader - Setup maps and attach XDP
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
 #include <net/if.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <arpa/inet.h>
-#include <linux/if_arp.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include <sys/stat.h>
 
-#ifndef bpf_xdp_attach
-#define bpf_xdp_attach(ifindex, fd, flags, opts) bpf_set_link_xdp_fd(ifindex, fd, flags)
-#define bpf_xdp_detach(ifindex, flags, opts) bpf_set_link_xdp_fd(ifindex, -1, flags)
-#endif
+#define IFACE_LAN 0
+#define IFACE_WAN 1
+#define MAX_WAN 4
+#define PIN_PATH "/sys/fs/bpf/tunnel"
 
-#define MAX_WAN 3
-
-struct wan_t { char iface[32]; __u32 ifidx; __u8 mymac[6], peermac[6]; char peer[32]; };
-struct cfg_t { char local[32]; __u32 lidx, rnet, rmask; __u8 lmac[6]; int nwan; struct wan_t wan[MAX_WAN]; };
-
-static volatile int run = 1;
-static struct cfg_t C;
+static volatile int running = 1;
 static struct bpf_object *obj;
-static int cfg_fd, mac_fd, arp_fd;
+static __u32 lan_ifindex;
+static __u32 wan_ifindex[MAX_WAN];
+static int wan_count;
 
-static void sig(int s) { (void)s; run = 0; }
-static __u64 m2u(__u8 *m) { return (__u64)m[0]|((__u64)m[1]<<8)|((__u64)m[2]<<16)|((__u64)m[3]<<24)|((__u64)m[4]<<32)|((__u64)m[5]<<40); }
+static void sig_handler(int sig) { (void)sig; running = 0; }
 
-static int getmac(const char *f, __u8 *m) {
-    int fd = socket(AF_INET, SOCK_DGRAM, 0); if (fd<0) return -1;
-    struct ifreq r = {0}; strncpy(r.ifr_name, f, IFNAMSIZ-1);
-    int ret = ioctl(fd, SIOCGIFHWADDR, &r); close(fd);
-    if (!ret) memcpy(m, r.ifr_hwaddr.sa_data, 6); return ret;
-}
+static int setup_maps(const char *lan, const char *remote_net, char **wans, int nwan)
+{
+    int config_fd = bpf_object__find_map_fd_by_name(obj, "config");
+    int iface_fd = bpf_object__find_map_fd_by_name(obj, "iface_map");
+    if (config_fd < 0 || iface_fd < 0) {
+        fprintf(stderr, "Map not found\n");
+        return -1;
+    }
 
-static int getpeermac(const char *f, const char *ip, __u8 *m) {
-    char cmd[128]; snprintf(cmd, sizeof(cmd), "ping -c1 -W1 -I %s %s >/dev/null 2>&1", f, ip);
-    (void)system(cmd);
-    int fd = socket(AF_INET, SOCK_DGRAM, 0); if (fd<0) return -1;
-    struct arpreq q = {0}; ((struct sockaddr_in*)&q.arp_pa)->sin_family = AF_INET;
-    inet_pton(AF_INET, ip, &((struct sockaddr_in*)&q.arp_pa)->sin_addr);
-    strncpy(q.arp_dev, f, sizeof(q.arp_dev)-1);
-    int ret = ioctl(fd, SIOCGARP, &q); close(fd);
-    if (!ret) memcpy(m, q.arp_ha.sa_data, 6); return ret;
-}
+    // Parse remote network (e.g., "192.168.182.0/24")
+    char buf[64];
+    strncpy(buf, remote_net, sizeof(buf) - 1);
+    char *slash = strchr(buf, '/');
+    int prefix = 24;
+    if (slash) { *slash = 0; prefix = atoi(slash + 1); }
 
-static int loadcfg(const char *p) {
-    FILE *f = fopen(p, "r"); if (!f) return -1;
-    memset(&C, 0, sizeof(C));
-    char line[256], key[32], v1[64], v2[64];
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0]=='#' || line[0]=='\n') continue;
-        v2[0]=0; int n = sscanf(line, "%31s %63s %63s", key, v1, v2); if (n<2) continue;
-        if (!strcmp(key, "local")) {
-            strncpy(C.local, v1, 31); C.lidx = if_nametoindex(v1); getmac(v1, C.lmac);
-        } else if (!strcmp(key, "remote")) {
-            char buf[64]; strncpy(buf, v1, 63);
-            char *sl = strchr(buf, '/'); int pfx = 24; if (sl) { *sl=0; pfx=atoi(sl+1); }
-            C.rnet = ntohl(inet_addr(buf)); C.rmask = pfx ? (0xFFFFFFFF << (32-pfx)) : 0;
-        } else if (!strcmp(key, "wan") && C.nwan < MAX_WAN) {
-            struct wan_t *w = &C.wan[C.nwan++];
-            strncpy(w->iface, v1, 31); w->ifidx = if_nametoindex(v1); getmac(v1, w->mymac);
-            if (n>=3) { strncpy(w->peer, v2, 31); getpeermac(v1, v2, w->peermac); }
+    __u32 rnet = ntohl(inet_addr(buf));
+    __u32 rmask = prefix ? (0xFFFFFFFF << (32 - prefix)) : 0;
+
+    // Setup config map
+    __u32 k = 0, v;
+    v = rnet;  bpf_map_update_elem(config_fd, &k, &v, BPF_ANY); k++;
+    v = rmask; bpf_map_update_elem(config_fd, &k, &v, BPF_ANY);
+
+    // Setup interface map
+    lan_ifindex = if_nametoindex(lan);
+    if (!lan_ifindex) {
+        fprintf(stderr, "LAN interface not found: %s\n", lan);
+        return -1;
+    }
+    __u8 type = IFACE_LAN;
+    bpf_map_update_elem(iface_fd, &lan_ifindex, &type, BPF_ANY);
+    printf("LAN: %s (ifindex=%d)\n", lan, lan_ifindex);
+
+    // Setup WAN interfaces
+    wan_count = 0;
+    type = IFACE_WAN;
+    for (int i = 0; i < nwan && i < MAX_WAN; i++) {
+        wan_ifindex[i] = if_nametoindex(wans[i]);
+        if (!wan_ifindex[i]) {
+            fprintf(stderr, "WAN interface not found: %s\n", wans[i]);
+            continue;
         }
+        bpf_map_update_elem(iface_fd, &wan_ifindex[i], &type, BPF_ANY);
+        printf("WAN%d: %s (ifindex=%d)\n", i, wans[i], wan_ifindex[i]);
+        wan_count++;
     }
-    fclose(f); return C.nwan > 0 ? 0 : -1;
-}
 
-static void detach(void) {
-    if (C.lidx) bpf_xdp_detach(C.lidx, 0, NULL);
-    for (int i=0; i<C.nwan; i++) if (C.wan[i].ifidx) bpf_xdp_detach(C.wan[i].ifidx, 0, NULL);
-}
-
-static int load_xdp(const char *file) {
-    obj = bpf_object__open_file(file, NULL);
-    if (libbpf_get_error(obj)) { obj=NULL; return -1; }
-    if (bpf_object__load(obj)) { bpf_object__close(obj); obj=NULL; return -1; }
-
-    cfg_fd = bpf_object__find_map_fd_by_name(obj, "config");
-    mac_fd = bpf_object__find_map_fd_by_name(obj, "macs");
-    arp_fd = bpf_object__find_map_fd_by_name(obj, "arp_cache");
-    struct bpf_program *tx = bpf_object__find_program_by_name(obj, "xdp_tx");
-    struct bpf_program *rx = bpf_object__find_program_by_name(obj, "xdp_rx");
-    if (!tx || !rx || cfg_fd<0 || mac_fd<0) return -1;
-
-    __u32 k, v; __u64 m;
-    k=0; v=C.nwan; bpf_map_update_elem(cfg_fd, &k, &v, BPF_ANY);
-    k=1; v=C.rnet; bpf_map_update_elem(cfg_fd, &k, &v, BPF_ANY);
-    k=2; v=C.rmask; bpf_map_update_elem(cfg_fd, &k, &v, BPF_ANY);
-    k=3; v=C.lidx; bpf_map_update_elem(cfg_fd, &k, &v, BPF_ANY);
-
-    for (int i=0; i<C.nwan; i++) {
-        k=4+i; v=C.wan[i].ifidx; bpf_map_update_elem(cfg_fd, &k, &v, BPF_ANY);
-        k=i; m=m2u(C.wan[i].mymac); bpf_map_update_elem(mac_fd, &k, &m, BPF_ANY);
-        k=i+MAX_WAN; m=m2u(C.wan[i].peermac); bpf_map_update_elem(mac_fd, &k, &m, BPF_ANY);
+    if (wan_count == 0) {
+        fprintf(stderr, "No valid WAN interfaces\n");
+        return -1;
     }
-    k=6; m=m2u(C.lmac); bpf_map_update_elem(mac_fd, &k, &m, BPF_ANY);
 
-    if (bpf_xdp_attach(C.lidx, bpf_program__fd(tx), 0, NULL) < 0) return -1;
-    printf("TX -> %s\n", C.local);
-    for (int i=0; i<C.nwan; i++) {
-        if (bpf_xdp_attach(C.wan[i].ifidx, bpf_program__fd(rx), 0, NULL) < 0) return -1;
-        printf("RX -> %s (%s)\n", C.wan[i].iface, C.wan[i].peer);
-    }
-    printf("Loaded: %d WANs, per-window LB\n", C.nwan);
+    printf("Remote: %s/%d\n", buf, prefix);
     return 0;
 }
 
-static void update_arp(void) {
-    FILE *fp = fopen("/proc/net/arp", "r"); if (!fp) return;
-    char line[256]; (void)fgets(line, sizeof(line), fp);
-    while (fgets(line, sizeof(line), fp)) {
-        char ip[32], hw[16], fl[16], mac[32], msk[16], iface[32];
-        if (sscanf(line, "%31s %15s %15s %31s %15s %31s", ip, hw, fl, mac, msk, iface) != 6) continue;
-        if (!(strtol(fl, NULL, 16) & 0x02) || strcmp(iface, C.local)) continue;
-        __u32 ipn = ntohl(inet_addr(ip)); unsigned mb[6];
-        if (sscanf(mac, "%x:%x:%x:%x:%x:%x", &mb[0],&mb[1],&mb[2],&mb[3],&mb[4],&mb[5]) == 6) {
-            __u64 mv = 0; for (int j=0; j<6; j++) mv |= ((__u64)mb[j]) << (j*8);
-            bpf_map_update_elem(arp_fd, &ipn, &mv, BPF_ANY);
-        }
+static void pin_maps(void)
+{
+    mkdir(PIN_PATH, 0755);
+
+    struct bpf_map *map;
+    bpf_object__for_each_map(map, obj) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%s", PIN_PATH, bpf_map__name(map));
+        bpf_map__unpin(map, path);
+        if (bpf_map__pin(map, path) == 0)
+            printf("Pinned: %s\n", path);
     }
-    fclose(fp);
 }
 
-int main(int argc, char **argv) {
-    if (argc < 2) { printf("Usage: %s <config> [bpf.o]\n", argv[0]); return 1; }
-    signal(SIGINT, sig); signal(SIGTERM, sig);
+static void detach_all(void)
+{
+    if (lan_ifindex)
+        bpf_xdp_detach(lan_ifindex, 0, NULL);
+    for (int i = 0; i < wan_count; i++)
+        if (wan_ifindex[i])
+            bpf_xdp_detach(wan_ifindex[i], 0, NULL);
+}
 
-    if (loadcfg(argv[1]) < 0) { fprintf(stderr, "Config error\n"); return 1; }
-    printf("Local: %s, Remote: %u.%u.%u.%u/%d, WANs: %d\n", C.local,
-        (C.rnet>>24)&0xff, (C.rnet>>16)&0xff, (C.rnet>>8)&0xff, C.rnet&0xff,
-        __builtin_popcount(C.rmask), C.nwan);
+static int attach_xdp(void)
+{
+    struct bpf_program *prog = bpf_object__find_program_by_name(obj, "xdp_classify");
+    if (!prog) {
+        fprintf(stderr, "Program not found\n");
+        return -1;
+    }
+    int fd = bpf_program__fd(prog);
 
-    if (load_xdp(argc >= 3 ? argv[2] : "./tunnel.bpf.o") < 0) {
-        fprintf(stderr, "XDP load failed\n"); detach(); return 1;
+    // Attach to LAN
+    if (bpf_xdp_attach(lan_ifindex, fd, 0, NULL) < 0) {
+        fprintf(stderr, "Attach LAN failed\n");
+        return -1;
+    }
+    printf("Attached to LAN\n");
+
+    // Attach to WANs
+    for (int i = 0; i < wan_count; i++) {
+        if (bpf_xdp_attach(wan_ifindex[i], fd, 0, NULL) < 0) {
+            fprintf(stderr, "Attach WAN%d failed\n", i);
+            return -1;
+        }
+        printf("Attached to WAN%d\n", i);
     }
 
-    printf("Running... Ctrl+C to stop\n");
-    while (run) { update_arp(); sleep(2); }
-
-    printf("Stopping...\n");
-    detach();
-    if (obj) bpf_object__close(obj);
     return 0;
 }
+
+int main(int argc, char **argv)
+{
+    if (argc < 4) {
+        printf("Usage: %s <lan_iface> <remote_net/prefix> <wan1> [wan2] ...\n", argv[0]);
+        printf("Example: %s enp7s0 192.168.182.0/24 eth1 eth2\n", argv[0]);
+        return 1;
+    }
+
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+
+    // Load BPF
+    obj = bpf_object__open_file("tunnel.bpf.o", NULL);
+    if (libbpf_get_error(obj)) {
+        fprintf(stderr, "Failed to open BPF object\n");
+        return 1;
+    }
+    if (bpf_object__load(obj)) {
+        fprintf(stderr, "Failed to load BPF object\n");
+        return 1;
+    }
+
+    // Setup maps
+    if (setup_maps(argv[1], argv[2], &argv[3], argc - 3) < 0) {
+        bpf_object__close(obj);
+        return 1;
+    }
+
+    // Pin maps for AF_XDP app
+    pin_maps();
+
+    // Attach XDP
+    if (attach_xdp() < 0) {
+        detach_all();
+        bpf_object__close(obj);
+        return 1;
+    }
+
+    printf("\nRunning. AF_XDP app can use maps at %s/xsks_map\n", PIN_PATH);
+    printf("Press Ctrl+C to stop\n\n");
+
+    while (running) {
+        sleep(1);
+    }
+
+    printf("\nDetaching...\n");
+    detach_all();
+    bpf_object__close(obj);
+    return 0;
+}
+
