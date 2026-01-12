@@ -1,17 +1,17 @@
-CLANG ?= clang
-CC ?= gcc
-CFLAGS = -O2 -Wall
-BPF_CFLAGS = -O2 -g -target bpf
+CC = gcc
+CLANG = clang
+CFLAGS = -O2 -Wall -pthread
+LDFLAGS = -lbpf -lxdp -lpthread -lssl -lcrypto
 
-all: tunnel.bpf.o tunnel_loader
+all: tunnel.bpf.o tunnel_daemon
 
 tunnel.bpf.o: tunnel.bpf.c
-        $(CLANG) $(BPF_CFLAGS) -c $< -o $@
+        $(CLANG) -O2 -g -target bpf -c $< -o $@
 
-tunnel_loader: tunnel_loader.c
-        $(CC) $(CFLAGS) $< -o $@ -lbpf
+tunnel_daemon: tunnel_daemon.c common.h
+        $(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 clean:
-        rm -f tunnel.bpf.o tunnel_loader
+        rm -f tunnel.bpf.o tunnel_daemon
 
 .PHONY: all clean
