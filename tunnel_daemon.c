@@ -471,9 +471,9 @@ static void send_to_vxlan(const uint8_t *orig_pkt, int orig_len, uint16_t flow_h
         uint8_t frame[INNER_MTU];
         int frame_len = 0;
 
-        // Ethernet header (inner)
+        // Ethernet header (inner) - use broadcast MAC so all peers receive
         struct ethhdr *eth = (struct ethhdr *)frame;
-        memset(eth->h_dest, 0x02, 6);    // Local MAC
+        memset(eth->h_dest, 0xff, 6);    // Broadcast MAC (ff:ff:ff:ff:ff:ff)
         memset(eth->h_source, 0x01, 6);  // Local MAC
         eth->h_proto = htons(CUSTOM_ETHERTYPE);
         frame_len += ETH_HLEN;
@@ -533,10 +533,10 @@ static void send_nack(int tunnel_idx, uint32_t msg_id, uint16_t frag_idx, uint16
     uint8_t frame[ETH_HLEN + TUNNEL_HDR_LEN];
     int frame_len = 0;
 
-    // Ethernet header
+    // Ethernet header - use broadcast MAC for NACK
     struct ethhdr *eth = (struct ethhdr *)frame;
-    memset(eth->h_dest, 0x01, 6);
-    memset(eth->h_source, 0x02, 6);
+    memset(eth->h_dest, 0xff, 6);    // Broadcast MAC
+    memset(eth->h_source, 0x01, 6);  // Local MAC
     eth->h_proto = htons(CUSTOM_ETHERTYPE);
     frame_len += ETH_HLEN;
 
@@ -576,7 +576,7 @@ static void resend_fragment(uint32_t msg_id, uint16_t frag_idx) {
         .sll_ifindex = tun->ifindex,
         .sll_halen = 6,
     };
-    memset(sll.sll_addr, 0x02, 6);
+    memset(sll.sll_addr, 0xff, 6);  // Broadcast MAC
 
     if (sendto(tun->sock_fd, e->data, e->data_len, 0,
                (struct sockaddr *)&sll, sizeof(sll)) > 0) {
@@ -714,19 +714,48 @@ static void forward_to_lan(const uint8_t *pkt, int len) {
     desc->len = len;
 
     xsk_ring_prod__submit(&lan_xsk->tx, 1);
-    xsk_socket__update_if_needed(lan_xsk->xsk);
+    // Kick kernel to send (compatible with older libxdp)
+    sendto(xsk_socket__fd(lan_xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
     lan_xsk->outstanding_tx++;
 }
 
 // ============ PROCESS RECEIVED VXLAN PACKET ============
+static int process_debug = 0;
 static void process_vxlan_rx(const uint8_t *frame, int frame_len, int tunnel_idx) {
-    if (frame_len < ETH_HLEN + TUNNEL_HDR_LEN) return;
+    if (frame_len < ETH_HLEN + TUNNEL_HDR_LEN) {
+        if (process_debug < 5) {
+            printf("[PROCESS] Rejected: frame too short (%d < %lu)\n",
+                   frame_len, ETH_HLEN + TUNNEL_HDR_LEN);
+            process_debug++;
+        }
+        return;
+    }
 
     struct ethhdr *eth = (struct ethhdr *)frame;
-    if (ntohs(eth->h_proto) != CUSTOM_ETHERTYPE) return;
+    if (ntohs(eth->h_proto) != CUSTOM_ETHERTYPE) {
+        if (process_debug < 5) {
+            printf("[PROCESS] Rejected: wrong ethertype 0x%04x (expect 0x%04x)\n",
+                   ntohs(eth->h_proto), CUSTOM_ETHERTYPE);
+            process_debug++;
+        }
+        return;
+    }
 
     struct tunnel_hdr *hdr = (struct tunnel_hdr *)(frame + ETH_HLEN);
-    if (ntohl(hdr->magic) != TUNNEL_MAGIC) return;
+    if (ntohl(hdr->magic) != TUNNEL_MAGIC) {
+        if (process_debug < 5) {
+            printf("[PROCESS] Rejected: wrong magic 0x%08x (expect 0x%08x)\n",
+                   ntohl(hdr->magic), TUNNEL_MAGIC);
+            process_debug++;
+        }
+        return;
+    }
+
+    if (process_debug < 10) {
+        printf("[PROCESS] Accepted packet: msg_id=%u frag=%u/%u\n",
+               ntohl(hdr->msg_id), ntohs(hdr->frag_idx), ntohs(hdr->frag_cnt));
+        process_debug++;
+    }
 
     uint32_t msg_id = ntohl(hdr->msg_id);
     uint16_t frag_idx = ntohs(hdr->frag_idx);
@@ -828,6 +857,7 @@ static void *vxlan_rx_thread(void *arg) {
     }
 
     uint8_t buf[2048];
+    static int debug_count = 0;
     while (running) {
         int ret = poll(pfds, tunnel_count, 100);
         if (ret <= 0) continue;
@@ -837,6 +867,18 @@ static void *vxlan_rx_thread(void *arg) {
 
             ssize_t len = recv(tunnels[i].sock_fd, buf, sizeof(buf), MSG_DONTWAIT);
             if (len > 0) {
+                // Debug: print first 10 packets received
+                if (debug_count < 10) {
+                    struct ethhdr *eth = (struct ethhdr *)buf;
+                    printf("[VXLAN RX DEBUG] tunnel=%d len=%zd ethertype=0x%04x\n",
+                           i, len, ntohs(eth->h_proto));
+                    if (len >= ETH_HLEN + 4) {
+                        uint32_t *magic = (uint32_t *)(buf + ETH_HLEN);
+                        printf("[VXLAN RX DEBUG] magic=0x%08x (expect 0x%08x)\n",
+                               ntohl(*magic), TUNNEL_MAGIC);
+                    }
+                    debug_count++;
+                }
                 process_vxlan_rx(buf, len, i);
             }
         }
@@ -848,12 +890,12 @@ static void *stats_thread(void *arg) {
     (void)arg;
     while (running) {
         sleep(5);
-        printf("\n[STATS] TX:%lu RX:%lu Frag:%lu/%lu Reasm:%lu NACK:%lu/%lu Resent:%lu Drop:%lu\n",
+        printf("\n[STATS] TX:%lu RX:%lu Frag:%lu/%lu Reasm:%lu NACK:%lu/%lu Resent:%lu Drop:%lu DecryptFail:%lu\n",
                stats.tx_packets, stats.rx_packets,
                stats.fragments_sent, stats.fragments_received,
                stats.reassembled,
                stats.nack_sent, stats.nack_received, stats.resent,
-               stats.dropped);
+               stats.dropped, stats.decrypt_fail);
     }
     return NULL;
 }
@@ -934,3 +976,4 @@ int main(int argc, char **argv) {
     printf("[STATS] Final - TX:%lu RX:%lu\n", stats.tx_packets, stats.rx_packets);
     return 0;
 }
+
