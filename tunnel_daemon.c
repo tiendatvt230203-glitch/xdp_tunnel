@@ -99,12 +99,24 @@ static int setup_xsk(struct xsk *x, const char *name, int qid) {
     size_t sz = NUM_FRAMES * FRAME_SIZE;
     if (posix_memalign(&x->mem, getpagesize(), sz)) return -1;
 
-    struct xsk_umem_config uc = { NUM_FRAMES, NUM_FRAMES, FRAME_SIZE, 0, 0 };
+    struct xsk_umem_config uc = {
+        .fill_size = NUM_FRAMES,
+        .comp_size = NUM_FRAMES,
+        .frame_size = FRAME_SIZE,
+        .frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
+        .flags = 0,
+    };
     if (xsk_umem__create(&x->umem, x->mem, sz, &x->fq, &x->cq, &uc)) return -1;
 
     pool_init(&x->pool);
 
-    struct xsk_socket_config sc = { NUM_FRAMES, NUM_FRAMES, XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD, XDP_FLAGS_DRV_MODE, XDP_USE_NEED_WAKEUP };
+    struct xsk_socket_config sc = {
+        .rx_size = NUM_FRAMES,
+        .tx_size = NUM_FRAMES,
+        .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
+        .xdp_flags = XDP_FLAGS_DRV_MODE,
+        .bind_flags = XDP_USE_NEED_WAKEUP,
+    };
     if (xsk_socket__create(&x->sk, name, qid, x->umem, &x->rx, &x->tx, &sc)) {
         sc.xdp_flags = XDP_FLAGS_SKB_MODE;
         if (xsk_socket__create(&x->sk, name, qid, x->umem, &x->rx, &x->tx, &sc)) return -1;
@@ -124,7 +136,7 @@ static int setup_xsk(struct xsk *x, const char *name, int qid) {
     struct bpf_map *m = bpf_object__find_map_by_name(xdp_program__bpf_obj(x->prog), "xsks_map");
     if (m) {
         int k = x->qid, v = xsk_socket__fd(x->sk);
-        bpf_map_update_elem(bpf_map__fd(m), &k, &v, 0);
+        bpf_map_update_elem(bpf_map__fd(m), &k, &v, BPF_ANY);
     }
 
     return 0;
@@ -327,6 +339,7 @@ static void cleanup_xsk(struct xsk *x) {
     if (x->sk) xsk_socket__delete(x->sk);
     if (x->umem) xsk_umem__delete(x->umem);
     if (x->mem) free(x->mem);
+    pthread_spin_destroy(&x->pool.l);
 }
 
 int main(int c, char **v) {
