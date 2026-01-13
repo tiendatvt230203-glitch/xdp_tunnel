@@ -1,4 +1,4 @@
-// tunnel_node.c - Encrypted tunnel (minimal)
+// tunnel_node.c - Bidirectional encrypted tunnel
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,7 +46,7 @@ struct wan_ctx {
     uint8_t local_mac[6];
     uint8_t peer_mac[6];
     uint64_t tx_seq;
-    uint64_t rx_last_seq;  // Simple replay: just track last seq
+    uint64_t rx_last_seq;
     struct bpf_object *bpf_obj;
 };
 
@@ -56,14 +56,12 @@ static struct wan_ctx wan[MAX_WAN];
 static int wan_cnt = 0;
 static struct bpf_object *lan_bpf_obj = NULL;
 static volatile int run = 1;
-static int mode = 0;  // 0=send, 1=recv
 static uint8_t key[KEY_SIZE];
 static uint8_t node_id[NODE_ID_SIZE];
 static uint16_t key_id = 1;
 
 static void sig_handler(int s) { (void)s; run = 0; }
 
-// Frame alloc
 static uint64_t alloc_frame(struct xsk_ctx *ctx) {
     return ctx->frame_cnt ? ctx->frames[--ctx->frame_cnt] : UINT64_MAX;
 }
@@ -72,7 +70,6 @@ static void free_frame(struct xsk_ctx *ctx, uint64_t f) {
     if (ctx->frame_cnt < NUM_FRAMES) ctx->frames[ctx->frame_cnt++] = f;
 }
 
-// Get MAC from interface
 static void get_mac(const char *ifname, uint8_t *mac) {
     char path[64];
     snprintf(path, sizeof(path), "/sys/class/net/%s/address", ifname);
@@ -85,7 +82,7 @@ static void get_mac(const char *ifname, uint8_t *mac) {
     }
 }
 
-// 5-tuple hash for load balancing
+// 5-tuple hash
 static uint32_t flow_hash(const uint8_t *pkt, int len) {
     if (len < ETH_HLEN + 20) return 0;
     const struct iphdr *ip = (void*)(pkt + ETH_HLEN);
@@ -113,7 +110,6 @@ static void build_nonce(uint8_t *nonce, uint8_t path_id, uint64_t seq) {
     nonce[11] = seq & 0xff;
 }
 
-// AES-256-GCM encrypt
 static int aead_encrypt(const uint8_t *plain, int plen, uint8_t *cipher,
                         const uint8_t *aad, int aad_len, const uint8_t *nonce, uint8_t *tag) {
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
@@ -131,7 +127,6 @@ static int aead_encrypt(const uint8_t *plain, int plen, uint8_t *cipher,
     return clen;
 }
 
-// AES-256-GCM decrypt
 static int aead_decrypt(const uint8_t *cipher, int clen, uint8_t *plain,
                         const uint8_t *aad, int aad_len, const uint8_t *nonce, const uint8_t *tag) {
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
@@ -202,9 +197,7 @@ static void xsk_cleanup(struct xsk_ctx *ctx) {
     if (ctx->umem_area) munmap(ctx->umem_area, NUM_FRAMES * FRAME_SIZE);
 }
 
-// TX one packet
 static void xsk_tx(struct xsk_ctx *ctx, const void *data, int len) {
-    // Complete pending
     uint32_t idx_cq;
     unsigned int comp = xsk_ring_cons__peek(&ctx->cq, 64, &idx_cq);
     if (comp) {
@@ -239,7 +232,7 @@ static void xsk_refill_fq(struct xsk_ctx *ctx, unsigned int n) {
     }
 }
 
-// BPF load and attach
+// BPF load
 static int load_bpf(const char *ifname, int ifidx, int wan_mode, struct bpf_object **obj) {
     *obj = bpf_object__open_file("tunnel.bpf.o", NULL);
     if (libbpf_get_error(*obj)) return -1;
@@ -261,7 +254,6 @@ static int load_bpf(const char *ifname, int ifidx, int wan_mode, struct bpf_obje
     return 0;
 }
 
-// Load key
 static void load_key(const char *keyfile) {
     FILE *f = fopen(keyfile, "rb");
     if (f) {
@@ -274,8 +266,8 @@ static void load_key(const char *keyfile) {
     memcpy(node_id, key, NODE_ID_SIZE);
 }
 
-// Sender loop: LAN RX -> encrypt -> WAN TX
-static void *sender_loop(void *arg) {
+// LAN RX thread: receive from LAN -> encrypt -> send to WAN
+static void *lan_rx_loop(void *arg) {
     (void)arg;
     uint8_t out[MAX_PKT];
 
@@ -293,24 +285,20 @@ static void *sender_loop(void *arg) {
             uint32_t len = xsk_ring_cons__rx_desc(&lan_ctx.rx, idx + i)->len;
             uint8_t *pkt = xsk_umem__get_data(lan_ctx.umem_area, addr);
 
-            // MTU guard
             if (len > MAX_INNER_LEN || len < ETH_HLEN) {
                 free_frame(&lan_ctx, addr);
                 continue;
             }
 
-            // Pick WAN path by flow hash
             uint32_t h = flow_hash(pkt, len);
             int path = h % wan_cnt;
             struct wan_ctx *w = &wan[path];
 
-            // Build L2 header
             struct ethhdr *eth = (void*)out;
             memcpy(eth->h_dest, w->peer_mac, 6);
             memcpy(eth->h_source, w->local_mac, 6);
             eth->h_proto = htons(TUN_ETYPE);
 
-            // Build tunnel header
             uint64_t seq = __sync_add_and_fetch(&w->tx_seq, 1);
             struct tun_hdr *hdr = (void*)(out + ETH_HLEN);
             hdr->ver = TUN_VERSION;
@@ -321,7 +309,6 @@ static void *sender_loop(void *arg) {
             hdr->inner_len = htons(len);
             hdr->seq = htobe64(seq);
 
-            // Encrypt
             uint8_t nonce[NONCE_SIZE];
             build_nonce(nonce, path, seq);
             uint8_t *cipher = out + ETH_HLEN + TUN_HDR_SIZE;
@@ -343,8 +330,8 @@ static void *sender_loop(void *arg) {
     return NULL;
 }
 
-// Receiver loop: WAN RX -> decrypt -> LAN TX
-static void *receiver_loop(void *arg) {
+// WAN RX thread: receive from WAN -> decrypt -> send to LAN
+static void *wan_rx_loop(void *arg) {
     int path = (int)(intptr_t)arg;
     struct xsk_ctx *ctx = &wan[path].xsk;
     uint8_t plain[MAX_PKT];
@@ -381,8 +368,6 @@ static void *receiver_loop(void *arg) {
             }
 
             uint64_t seq = be64toh(hdr->seq);
-
-            // Simple replay check
             if (seq <= wan[path].rx_last_seq) {
                 free_frame(ctx, addr);
                 continue;
@@ -418,7 +403,6 @@ static void *receiver_loop(void *arg) {
     return NULL;
 }
 
-// Cleanup
 static void cleanup(void) {
     xsk_cleanup(&lan_ctx);
     if (lan_ctx.ifidx) bpf_set_link_xdp_fd(lan_ctx.ifidx, -1, XDP_FLAGS_SKB_MODE);
@@ -433,19 +417,18 @@ static void cleanup(void) {
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s <send|recv> <lan_if> <wan1> [wan2...] [-k keyfile] [-p peer_mac]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <lan_if> <wan1> [wan2...] [-k keyfile] [-p peer_mac]\n", argv[0]);
         return 1;
     }
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    mode = (strcmp(argv[1], "recv") == 0) ? 1 : 0;
-    const char *lan_if = argv[2];
+    const char *lan_if = argv[1];
     const char *keyfile = "tunnel.key";
     uint8_t peer_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 
-    for (int i = 3; i < argc; i++) {
+    for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-k") == 0 && i+1 < argc) {
             keyfile = argv[++i];
         } else if (strcmp(argv[i], "-p") == 0 && i+1 < argc) {
@@ -467,11 +450,11 @@ int main(int argc, char **argv) {
     if (wan_cnt == 0) { fprintf(stderr, "No WAN\n"); return 1; }
     load_key(keyfile);
 
-    // Setup LAN
+    // Setup LAN (mode=0: intercept IP packets)
     int lan_ifidx = if_nametoindex(lan_if);
     if (!lan_ifidx) { fprintf(stderr, "Bad LAN\n"); return 1; }
 
-    if (load_bpf(lan_if, lan_ifidx, mode, &lan_bpf_obj) < 0) {
+    if (load_bpf(lan_if, lan_ifidx, 0, &lan_bpf_obj) < 0) {
         fprintf(stderr, "LAN BPF fail\n");
         return 1;
     }
@@ -486,39 +469,37 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Setup WAN
-    pthread_t threads[MAX_WAN];
+    // Setup WAN (mode=1: intercept tunnel packets)
+    pthread_t wan_threads[MAX_WAN];
 
     for (int i = 0; i < wan_cnt; i++) {
         char ifname[16];
         if_indextoname(wan[i].xsk.ifidx, ifname);
 
-        if (mode == 0) {
-            // Sender: WAN TX only (no XDP needed)
-            if (xsk_setup(&wan[i].xsk, ifname, -1) < 0)
-                fprintf(stderr, "WAN[%d] XSK fail\n", i);
-        } else {
-            // Receiver: WAN RX with XDP
-            if (load_bpf(ifname, wan[i].xsk.ifidx, 1, &wan[i].bpf_obj) < 0) continue;
-            struct bpf_map *wmap = bpf_object__find_map_by_name(wan[i].bpf_obj, "xsks_map");
-            if (xsk_setup(&wan[i].xsk, ifname, wmap ? bpf_map__fd(wmap) : -1) < 0) continue;
-            pthread_create(&threads[i], NULL, receiver_loop, (void*)(intptr_t)i);
+        if (load_bpf(ifname, wan[i].xsk.ifidx, 1, &wan[i].bpf_obj) < 0) {
+            fprintf(stderr, "WAN[%d] BPF fail\n", i);
+            continue;
         }
+
+        struct bpf_map *wmap = bpf_object__find_map_by_name(wan[i].bpf_obj, "xsks_map");
+        if (xsk_setup(&wan[i].xsk, ifname, wmap ? bpf_map__fd(wmap) : -1) < 0) {
+            fprintf(stderr, "WAN[%d] XSK fail\n", i);
+            continue;
+        }
+
+        pthread_create(&wan_threads[i], NULL, wan_rx_loop, (void*)(intptr_t)i);
     }
 
-    pthread_t sender_thread;
-    if (mode == 0) {
-        pthread_create(&sender_thread, NULL, sender_loop, NULL);
-    }
+    // Start LAN RX thread
+    pthread_t lan_thread;
+    pthread_create(&lan_thread, NULL, lan_rx_loop, NULL);
 
+    // Wait
     while (run) sleep(1);
 
-    if (mode == 0) {
-        pthread_join(sender_thread, NULL);
-    } else {
-        for (int i = 0; i < wan_cnt; i++)
-            pthread_join(threads[i], NULL);
-    }
+    pthread_join(lan_thread, NULL);
+    for (int i = 0; i < wan_cnt; i++)
+        pthread_join(wan_threads[i], NULL);
 
     cleanup();
     return 0;
