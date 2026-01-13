@@ -1,4 +1,4 @@
-// tunnel_node.c - Bidirectional encrypted tunnel
+// tunnel_node.c - Bidirectional encrypted tunnel with AF_XDP
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,9 +16,8 @@
 #include <linux/ip.h>
 #include <linux/if_xdp.h>
 #include <arpa/inet.h>
-#include <bpf/bpf.h>
-#include <bpf/libbpf.h>
 #include <xdp/xsk.h>
+#include <xdp/libxdp.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include "tunnel.h"
@@ -38,6 +37,7 @@ struct xsk_ctx {
     uint32_t frames[NUM_FRAMES];
     uint32_t frame_cnt;
     int ifidx;
+    char ifname[16];
 };
 
 // WAN context
@@ -47,14 +47,12 @@ struct wan_ctx {
     uint8_t peer_mac[6];
     uint64_t tx_seq;
     uint64_t rx_last_seq;
-    struct bpf_object *bpf_obj;
 };
 
 // Globals
 static struct xsk_ctx lan_ctx;
 static struct wan_ctx wan[MAX_WAN];
 static int wan_cnt = 0;
-static struct bpf_object *lan_bpf_obj = NULL;
 static volatile int run = 1;
 static uint8_t key[KEY_SIZE];
 static uint8_t node_id[NODE_ID_SIZE];
@@ -97,7 +95,7 @@ static uint32_t flow_hash(const uint8_t *pkt, int len) {
     return h;
 }
 
-// Nonce: node_id(4) + path(1) + key_id(1) + seq(6)
+// Nonce
 static void build_nonce(uint8_t *nonce, uint8_t path_id, uint64_t seq) {
     memcpy(nonce, node_id, 4);
     nonce[4] = path_id;
@@ -144,16 +142,28 @@ static int aead_decrypt(const uint8_t *cipher, int clen, uint8_t *plain,
     return ret > 0 ? plen + len : -1;
 }
 
-// XSK setup
-static int xsk_setup(struct xsk_ctx *ctx, const char *ifname, int map_fd) {
+// XSK setup using libxdp
+static int xsk_setup(struct xsk_ctx *ctx, const char *ifname) {
+    strncpy(ctx->ifname, ifname, 15);
     ctx->ifidx = if_nametoindex(ifname);
     if (!ctx->ifidx) return -1;
 
     size_t sz = NUM_FRAMES * FRAME_SIZE;
-    ctx->umem_area = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if (ctx->umem_area == MAP_FAILED) return -1;
+    ctx->umem_area = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
+    if (ctx->umem_area == MAP_FAILED) {
+        // Fallback to regular pages
+        ctx->umem_area = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        if (ctx->umem_area == MAP_FAILED) return -1;
+    }
 
-    struct xsk_umem_config ucfg = {.fill_size=4096, .comp_size=4096, .frame_size=FRAME_SIZE};
+    struct xsk_umem_config ucfg = {
+        .fill_size = 4096,
+        .comp_size = 4096,
+        .frame_size = FRAME_SIZE,
+        .frame_headroom = 0,
+        .flags = 0
+    };
+
     if (xsk_umem__create(&ctx->umem, ctx->umem_area, sz, &ctx->fq, &ctx->cq, &ucfg)) {
         munmap(ctx->umem_area, sz);
         return -1;
@@ -163,24 +173,22 @@ static int xsk_setup(struct xsk_ctx *ctx, const char *ifname, int map_fd) {
     ctx->frame_cnt = NUM_FRAMES;
 
     struct xsk_socket_config xcfg = {
-        .rx_size = 4096, .tx_size = 4096,
-        .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
+        .rx_size = 4096,
+        .tx_size = 4096,
+        .libxdp_flags = 0,
         .xdp_flags = XDP_FLAGS_SKB_MODE,
         .bind_flags = XDP_COPY | XDP_USE_NEED_WAKEUP
     };
 
-    if (xsk_socket__create(&ctx->xsk, ifname, 0, ctx->umem, &ctx->rx, &ctx->tx, &xcfg)) {
+    int ret = xsk_socket__create(&ctx->xsk, ifname, 0, ctx->umem, &ctx->rx, &ctx->tx, &xcfg);
+    if (ret) {
+        fprintf(stderr, "xsk_socket__create(%s) failed: %d\n", ifname, ret);
         xsk_umem__delete(ctx->umem);
         munmap(ctx->umem_area, sz);
         return -1;
     }
 
-    if (map_fd >= 0) {
-        int fd = xsk_socket__fd(ctx->xsk);
-        uint32_t k = 0;
-        bpf_map_update_elem(map_fd, &k, &fd, 0);
-    }
-
+    // Fill the fill queue
     uint32_t idx = 0;
     if (xsk_ring_prod__reserve(&ctx->fq, 4096, &idx) == 4096) {
         for (int i = 0; i < 4096; i++)
@@ -232,28 +240,6 @@ static void xsk_refill_fq(struct xsk_ctx *ctx, unsigned int n) {
     }
 }
 
-// BPF load
-static int load_bpf(const char *ifname, int ifidx, int wan_mode, struct bpf_object **obj) {
-    *obj = bpf_object__open_file("tunnel.bpf.o", NULL);
-    if (libbpf_get_error(*obj)) return -1;
-    if (bpf_object__load(*obj)) { bpf_object__close(*obj); return -1; }
-
-    struct bpf_program *prog = bpf_object__find_program_by_name(*obj, "xdp_prog");
-    if (!prog) { bpf_object__close(*obj); return -1; }
-
-    struct bpf_map *mode_map = bpf_object__find_map_by_name(*obj, "mode_map");
-    if (mode_map) {
-        uint32_t k = 0, v = wan_mode;
-        bpf_map_update_elem(bpf_map__fd(mode_map), &k, &v, 0);
-    }
-
-    if (bpf_set_link_xdp_fd(ifidx, bpf_program__fd(prog), XDP_FLAGS_SKB_MODE) < 0) {
-        bpf_object__close(*obj);
-        return -1;
-    }
-    return 0;
-}
-
 static void load_key(const char *keyfile) {
     FILE *f = fopen(keyfile, "rb");
     if (f) {
@@ -264,6 +250,20 @@ static void load_key(const char *keyfile) {
         RAND_bytes(key, KEY_SIZE);
     }
     memcpy(node_id, key, NODE_ID_SIZE);
+}
+
+// Check if packet is tunnel frame
+static int is_tunnel_frame(const uint8_t *pkt, int len) {
+    if (len < ETH_HLEN) return 0;
+    struct ethhdr *eth = (void*)pkt;
+    return ntohs(eth->h_proto) == TUN_ETYPE;
+}
+
+// Check if packet is IP
+static int is_ip_frame(const uint8_t *pkt, int len) {
+    if (len < ETH_HLEN) return 0;
+    struct ethhdr *eth = (void*)pkt;
+    return ntohs(eth->h_proto) == ETH_P_IP;
 }
 
 // LAN RX thread: receive from LAN -> encrypt -> send to WAN
@@ -284,6 +284,12 @@ static void *lan_rx_loop(void *arg) {
             uint64_t addr = xsk_ring_cons__rx_desc(&lan_ctx.rx, idx + i)->addr;
             uint32_t len = xsk_ring_cons__rx_desc(&lan_ctx.rx, idx + i)->len;
             uint8_t *pkt = xsk_umem__get_data(lan_ctx.umem_area, addr);
+
+            // Only process IP packets, skip others
+            if (!is_ip_frame(pkt, len)) {
+                free_frame(&lan_ctx, addr);
+                continue;
+            }
 
             if (len > MAX_INNER_LEN || len < ETH_HLEN) {
                 free_frame(&lan_ctx, addr);
@@ -350,13 +356,13 @@ static void *wan_rx_loop(void *arg) {
             uint32_t len = xsk_ring_cons__rx_desc(&ctx->rx, idx + i)->len;
             uint8_t *pkt = xsk_umem__get_data(ctx->umem_area, addr);
 
-            if (len < ETH_HLEN + TUN_HDR_SIZE + TAG_SIZE) {
+            // Only process tunnel frames
+            if (!is_tunnel_frame(pkt, len)) {
                 free_frame(ctx, addr);
                 continue;
             }
 
-            struct ethhdr *eth = (void*)pkt;
-            if (ntohs(eth->h_proto) != TUN_ETYPE) {
+            if (len < ETH_HLEN + TUN_HDR_SIZE + TAG_SIZE) {
                 free_frame(ctx, addr);
                 continue;
             }
@@ -405,13 +411,8 @@ static void *wan_rx_loop(void *arg) {
 
 static void cleanup(void) {
     xsk_cleanup(&lan_ctx);
-    if (lan_ctx.ifidx) bpf_set_link_xdp_fd(lan_ctx.ifidx, -1, XDP_FLAGS_SKB_MODE);
-    if (lan_bpf_obj) bpf_object__close(lan_bpf_obj);
-
     for (int i = 0; i < wan_cnt; i++) {
         xsk_cleanup(&wan[i].xsk);
-        if (wan[i].xsk.ifidx) bpf_set_link_xdp_fd(wan[i].xsk.ifidx, -1, XDP_FLAGS_SKB_MODE);
-        if (wan[i].bpf_obj) bpf_object__close(wan[i].bpf_obj);
     }
 }
 
@@ -459,6 +460,7 @@ int main(int argc, char **argv) {
                 if (ifidx) {
                     memset(&wan[wan_cnt], 0, sizeof(wan[wan_cnt]));
                     wan[wan_cnt].xsk.ifidx = ifidx;
+                    strncpy(wan[wan_cnt].xsk.ifname, ifname, 15);
                     get_mac(ifname, wan[wan_cnt].local_mac);
                     memcpy(wan[wan_cnt].peer_mac, peer_mac, 6);
                     wan_cnt++;
@@ -467,46 +469,33 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (wan_cnt == 0) { fprintf(stderr, "No WAN\n"); return 1; }
+    if (wan_cnt == 0) { fprintf(stderr, "No WAN interfaces\n"); return 1; }
     load_key(keyfile);
 
-    // Setup LAN (mode=0: intercept IP packets)
-    int lan_ifidx = if_nametoindex(lan_if);
-    if (!lan_ifidx) { fprintf(stderr, "Bad LAN\n"); return 1; }
+    printf("Setting up LAN: %s\n", lan_if);
 
-    if (load_bpf(lan_if, lan_ifidx, 0, &lan_bpf_obj) < 0) {
-        fprintf(stderr, "LAN BPF fail\n");
+    // Setup LAN
+    strncpy(lan_ctx.ifname, lan_if, 15);
+    if (xsk_setup(&lan_ctx, lan_if) < 0) {
+        fprintf(stderr, "LAN XSK setup failed\n");
         return 1;
     }
+    printf("LAN XSK ready\n");
 
-    struct bpf_map *xsks_map = bpf_object__find_map_by_name(lan_bpf_obj, "xsks_map");
-    int map_fd = xsks_map ? bpf_map__fd(xsks_map) : -1;
-
-    lan_ctx.ifidx = lan_ifidx;
-    if (xsk_setup(&lan_ctx, lan_if, map_fd) < 0) {
-        fprintf(stderr, "LAN XSK fail\n");
-        cleanup();
-        return 1;
-    }
-
-    // Setup WAN (mode=1: intercept tunnel packets)
+    // Setup WAN
     pthread_t wan_threads[MAX_WAN];
 
     for (int i = 0; i < wan_cnt; i++) {
-        char ifname[16];
-        if_indextoname(wan[i].xsk.ifidx, ifname);
+        printf("Setting up WAN[%d]: %s -> %02x:%02x:%02x:%02x:%02x:%02x\n",
+               i, wan[i].xsk.ifname,
+               wan[i].peer_mac[0], wan[i].peer_mac[1], wan[i].peer_mac[2],
+               wan[i].peer_mac[3], wan[i].peer_mac[4], wan[i].peer_mac[5]);
 
-        if (load_bpf(ifname, wan[i].xsk.ifidx, 1, &wan[i].bpf_obj) < 0) {
-            fprintf(stderr, "WAN[%d] BPF fail\n", i);
+        if (xsk_setup(&wan[i].xsk, wan[i].xsk.ifname) < 0) {
+            fprintf(stderr, "WAN[%d] XSK setup failed\n", i);
             continue;
         }
-
-        struct bpf_map *wmap = bpf_object__find_map_by_name(wan[i].bpf_obj, "xsks_map");
-        if (xsk_setup(&wan[i].xsk, ifname, wmap ? bpf_map__fd(wmap) : -1) < 0) {
-            fprintf(stderr, "WAN[%d] XSK fail\n", i);
-            continue;
-        }
-
+        printf("WAN[%d] XSK ready\n", i);
         pthread_create(&wan_threads[i], NULL, wan_rx_loop, (void*)(intptr_t)i);
     }
 
@@ -514,13 +503,18 @@ int main(int argc, char **argv) {
     pthread_t lan_thread;
     pthread_create(&lan_thread, NULL, lan_rx_loop, NULL);
 
+    printf("Tunnel running. Press Ctrl+C to stop.\n");
+
     // Wait
     while (run) sleep(1);
+
+    printf("\nShutting down...\n");
 
     pthread_join(lan_thread, NULL);
     for (int i = 0; i < wan_cnt; i++)
         pthread_join(wan_threads[i], NULL);
 
     cleanup();
+    printf("Done.\n");
     return 0;
 }

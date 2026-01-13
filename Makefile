@@ -1,17 +1,16 @@
 CC = gcc
-CLANG = clang
 CFLAGS = -O2 -Wall -pthread
-LDFLAGS = -lbpf -lxdp -lpthread
+LDFLAGS = -lxdp -lbpf -lpthread -lssl -lcrypto
 
-all: tunnel.bpf.o tunnel_xdp_lb
+all: tunnel_node
 
-tunnel.bpf.o: tunnel.bpf.c
-        $(CLANG) -O2 -g -target bpf -c $< -o $@
-
-tunnel_xdp_lb: tunnel_xdp_lb.c
+tunnel_node: tunnel_node.c tunnel.h
         $(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-clean:
-        rm -f tunnel.bpf.o tunnel_xdp_lb
+key:
+        openssl rand -out tunnel.key 32
 
-.PHONY: all clean
+clean:
+        rm -f tunnel_node tunnel.key
+
+.PHONY: all clean key
