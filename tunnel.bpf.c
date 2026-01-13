@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-// XDP Tunnel - Load Balancing với hook mã hóa
+// XDP Tunnel - Window-based Load Balancing (64KB per WAN)
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
@@ -11,9 +11,9 @@
 
 #define AF_INET 2
 #define MAX_WAN 3
+#define WINDOW_SIZE 65536  // 64KB rồi chuyển WAN
 
 // ============== HOOK MÃ HÓA (THÊM SAU) ==============
-// Trả về 0 = OK, -1 = drop packet
 static __always_inline int encrypt_hook(void *data, void *end, struct iphdr *ip) {
     // TODO: Thêm mã hóa payload ở đây
     return 0;
@@ -25,32 +25,32 @@ static __always_inline int decrypt_hook(void *data, void *end, struct iphdr *ip)
 }
 // ====================================================
 
-// Jenkins hash - phân phối đều hơn XOR
-static __always_inline __u32 jhash_3words(__u32 a, __u32 b, __u32 c) {
-    a += 0xdeadbeef;
-    b += 0xdeadbeef;
-    c += 0xdeadbeef;
+// Flow key (5-tuple)
+struct flow_key {
+    __u32 saddr;
+    __u32 daddr;
+    __u16 sport;
+    __u16 dport;
+    __u8  proto;
+    __u8  pad[3];
+};
 
-    c ^= b; c -= (b << 14) | (b >> 18);
-    a ^= c; a -= (c << 11) | (c >> 21);
-    b ^= a; b -= (a << 25) | (a >> 7);
-    c ^= b; c -= (b << 16) | (b >> 16);
-    a ^= c; a -= (c << 4) | (c >> 28);
-    b ^= a; b -= (a << 14) | (a >> 18);
-    c ^= b; c -= (b << 24) | (b >> 8);
-
-    return c;
-}
-
-// Hash 5-tuple để chọn WAN
-static __always_inline __u32 flow_hash(__u32 saddr, __u32 daddr, __u16 sport, __u16 dport, __u8 proto, __u32 nwan) {
-    __u32 hash = jhash_3words(saddr ^ daddr, ((__u32)sport << 16) | dport, proto);
-    return hash % nwan;
-}
+// Connection state - theo dõi bytes đã gửi
+struct conn_state {
+    __u32 current_wan;      // WAN đang dùng
+    __u32 bytes_in_window;  // Bytes đã gửi trong window hiện tại
+};
 
 // Maps
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 16); __type(key, __u32); __type(value, __u32); } config SEC(".maps");
 struct { __uint(type, BPF_MAP_TYPE_ARRAY); __uint(max_entries, 8); __type(key, __u32); __type(value, __u64); } macs SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 100000);
+    __type(key, struct flow_key);
+    __type(value, struct conn_state);
+} conn_track SEC(".maps");
 
 static __always_inline void set_mac(__u8 *d, __u64 m) {
     d[0]=m; d[1]=m>>8; d[2]=m>>16; d[3]=m>>24; d[4]=m>>32; d[5]=m>>40;
@@ -67,8 +67,6 @@ int xdp_tx(struct xdp_md *ctx) {
 
     struct iphdr *ip = (void*)(eth + 1);
     if ((void*)(ip + 1) > end) return XDP_PASS;
-    if (ip->protocol != IPPROTO_TCP && ip->protocol != IPPROTO_UDP && ip->protocol != IPPROTO_ICMP)
-        return XDP_PASS;
 
     // Lấy config
     __u32 k = 0;
@@ -80,22 +78,54 @@ int xdp_tx(struct xdp_md *ctx) {
     // Chỉ xử lý packet đến remote network
     if ((bpf_ntohl(ip->daddr) & *rmask) != (*rnet & *rmask)) return XDP_PASS;
 
-    // Lấy port để hash
-    __u16 sport = 0, dport = 0;
+    // Build flow key và tính payload size
+    struct flow_key fkey = {0};
+    fkey.saddr = ip->saddr;
+    fkey.daddr = ip->daddr;
+    fkey.proto = ip->protocol;
+
+    __u32 payload_len = bpf_ntohs(ip->tot_len);
+    __u32 idx = 0;
+
     if (ip->protocol == IPPROTO_TCP) {
         struct tcphdr *tcp = (void*)ip + (ip->ihl * 4);
         if ((void*)(tcp + 1) > end) return XDP_PASS;
-        sport = tcp->source;
-        dport = tcp->dest;
+        fkey.sport = tcp->source;
+        fkey.dport = tcp->dest;
+        payload_len -= (ip->ihl * 4) + (tcp->doff * 4);
     } else if (ip->protocol == IPPROTO_UDP) {
         struct udphdr *udp = (void*)ip + (ip->ihl * 4);
         if ((void*)(udp + 1) > end) return XDP_PASS;
-        sport = udp->source;
-        dport = udp->dest;
+        fkey.sport = udp->source;
+        fkey.dport = udp->dest;
+        payload_len -= (ip->ihl * 4) + sizeof(struct udphdr);
+    } else if (ip->protocol == IPPROTO_ICMP) {
+        payload_len -= (ip->ihl * 4);
+    } else {
+        return XDP_PASS;
     }
 
-    // Hash chọn WAN
-    __u32 idx = flow_hash(ip->saddr, ip->daddr, sport, dport, ip->protocol, *nwan);
+    // Window-based load balancing
+    struct conn_state *state = bpf_map_lookup_elem(&conn_track, &fkey);
+    if (state) {
+        // Cộng thêm bytes
+        state->bytes_in_window += payload_len;
+
+        // Đủ 64KB -> chuyển WAN
+        if (state->bytes_in_window >= WINDOW_SIZE) {
+            state->current_wan = (state->current_wan + 1) % *nwan;
+            state->bytes_in_window = 0;
+        }
+        idx = state->current_wan;
+    } else {
+        // Flow mới - bắt đầu từ WAN 0
+        struct conn_state new_state = {
+            .current_wan = 0,
+            .bytes_in_window = payload_len
+        };
+        bpf_map_update_elem(&conn_track, &fkey, &new_state, BPF_ANY);
+        idx = 0;
+    }
 
     // Lấy WAN interface và MAC
     k = 4 + idx;
@@ -125,8 +155,6 @@ int xdp_rx(struct xdp_md *ctx) {
 
     struct iphdr *ip = (void*)(eth + 1);
     if ((void*)(ip + 1) > end) return XDP_PASS;
-    if (ip->protocol != IPPROTO_TCP && ip->protocol != IPPROTO_UDP && ip->protocol != IPPROTO_ICMP)
-        return XDP_PASS;
 
     // Kiểm tra source từ remote network
     __u32 k = 1;
