@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <net/if.h>
 #include <linux/if_ether.h>
+#include <linux/if_link.h>
 #include <linux/ip.h>
 #include <linux/if_xdp.h>
 #include <arpa/inet.h>
@@ -263,8 +264,13 @@ static int load_bpf(const char *ifname, int ifidx, int wan_mode, struct bpf_obje
 // Load key
 static void load_key(const char *keyfile) {
     FILE *f = fopen(keyfile, "rb");
-    if (f) { fread(key, 1, KEY_SIZE, f); fclose(f); }
-    else RAND_bytes(key, KEY_SIZE);
+    if (f) {
+        if (fread(key, 1, KEY_SIZE, f) != KEY_SIZE)
+            RAND_bytes(key, KEY_SIZE);
+        fclose(f);
+    } else {
+        RAND_bytes(key, KEY_SIZE);
+    }
     memcpy(node_id, key, NODE_ID_SIZE);
 }
 
@@ -517,4 +523,3 @@ int main(int argc, char **argv) {
     cleanup();
     return 0;
 }
-
