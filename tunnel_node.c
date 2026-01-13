@@ -80,7 +80,7 @@ static void get_mac(const char *ifname, uint8_t *mac) {
 static void set_single_queue(const char *ifname) {
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "ethtool -L %s combined 1 2>/dev/null", ifname);
-    system(cmd);
+    (void)system(cmd);
 }
 
 static uint32_t flow_hash(const uint8_t *pkt, int len) {
@@ -121,9 +121,9 @@ static int load_xdp_program(struct xsk_ctx *ctx) {
 
     ctx->xdp_prog_fd = bpf_program__fd(prog);
 
-    // Try native mode first, fallback to SKB
-    if (bpf_xdp_attach(ctx->ifidx, ctx->xdp_prog_fd, XDP_FLAGS_DRV_MODE, NULL) < 0) {
-        if (bpf_xdp_attach(ctx->ifidx, ctx->xdp_prog_fd, XDP_FLAGS_SKB_MODE, NULL) < 0) {
+    // Try native mode first, fallback to SKB (use older API for compatibility)
+    if (bpf_set_link_xdp_fd(ctx->ifidx, ctx->xdp_prog_fd, XDP_FLAGS_DRV_MODE) < 0) {
+        if (bpf_set_link_xdp_fd(ctx->ifidx, ctx->xdp_prog_fd, XDP_FLAGS_SKB_MODE) < 0) {
             fprintf(stderr, "Failed to attach XDP to %s\n", ctx->ifname);
             bpf_object__close(ctx->bpf_obj);
             ctx->bpf_obj = NULL;
@@ -219,7 +219,7 @@ static void xsk_cleanup(struct xsk_ctx *ctx) {
     if (ctx->umem_area) munmap(ctx->umem_area, NUM_FRAMES * FRAME_SIZE);
 
     if (ctx->ifidx) {
-        bpf_xdp_detach(ctx->ifidx, 0, NULL);
+        bpf_set_link_xdp_fd(ctx->ifidx, -1, 0);
         printf("  [%s] XDP detached\n", ctx->ifname);
     }
     if (ctx->bpf_obj) bpf_object__close(ctx->bpf_obj);
@@ -385,7 +385,6 @@ static void *wan_rx_loop(void *arg) {
 
             // FIX: Rewrite MAC header before sending to LAN
             // Keep original dst MAC (client), rewrite src to LAN interface MAC
-            struct ethhdr *inner_eth = (void*)inner;
             memcpy(out, inner, inner_len);
             struct ethhdr *out_eth = (void*)out;
             // dst MAC stays as-is (original destination)
