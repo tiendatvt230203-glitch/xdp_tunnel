@@ -155,28 +155,33 @@ static int load_xdp_for_iface(struct xsk_ctx *ctx) {
 }
 
 static int xsk_setup(struct xsk_ctx *ctx, const char *ifname) {
+    // Save ifname first (in case ifname points into ctx which memset will clear)
+    char saved_ifname[16];
+    strncpy(saved_ifname, ifname, 15);
+    saved_ifname[15] = 0;
+
     memset(ctx, 0, sizeof(*ctx));
-    strncpy(ctx->ifname, ifname, 15);
-    ctx->ifidx = if_nametoindex(ifname);
+    strncpy(ctx->ifname, saved_ifname, 15);
+    ctx->ifidx = if_nametoindex(saved_ifname);
     if (!ctx->ifidx) {
-        fprintf(stderr, "[%s] Interface not found\n", ifname);
+        fprintf(stderr, "[%s] Interface not found\n", saved_ifname);
         return -1;
     }
 
-    get_mac(ifname, ctx->local_mac);
+    get_mac(ctx->ifname, ctx->local_mac);
     pthread_spin_init(&ctx->tx_lock, PTHREAD_PROCESS_PRIVATE);
 
     // Load BPF for this interface
     if (load_xdp_for_iface(ctx) < 0) {
-        fprintf(stderr, "[%s] load_xdp_for_iface failed\n", ifname);
+        fprintf(stderr, "[%s] load_xdp_for_iface failed\n", ctx->ifname);
         return -1;
     }
 
     size_t sz = NUM_FRAMES * FRAME_SIZE;
-    printf("  [%s] Allocating UMEM (%zu bytes)...\n", ifname, sz);
+    printf("  [%s] Allocating UMEM (%zu bytes)...\n", ctx->ifname, sz);
     ctx->umem_area = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (ctx->umem_area == MAP_FAILED) {
-        fprintf(stderr, "[%s] mmap failed: %s\n", ifname, strerror(errno));
+        fprintf(stderr, "[%s] mmap failed: %s\n", ctx->ifname, strerror(errno));
         return -1;
     }
 
@@ -188,10 +193,10 @@ static int xsk_setup(struct xsk_ctx *ctx, const char *ifname) {
         .flags = 0
     };
 
-    printf("  [%s] Creating UMEM...\n", ifname);
+    printf("  [%s] Creating UMEM...\n", ctx->ifname);
     int ret = xsk_umem__create(&ctx->umem, ctx->umem_area, sz, &ctx->fq, &ctx->cq, &ucfg);
     if (ret) {
-        fprintf(stderr, "[%s] umem create failed: %d (%s)\n", ifname, ret, strerror(-ret));
+        fprintf(stderr, "[%s] umem create failed: %d (%s)\n", ctx->ifname, ret, strerror(-ret));
         munmap(ctx->umem_area, sz);
         return -1;
     }
@@ -207,10 +212,10 @@ static int xsk_setup(struct xsk_ctx *ctx, const char *ifname) {
         .bind_flags = XDP_USE_NEED_WAKEUP
     };
 
-    printf("  [%s] Creating XSK socket (queue 0)...\n", ifname);
-    ret = xsk_socket__create(&ctx->xsk, ifname, 0, ctx->umem, &ctx->rx, &ctx->tx, &xcfg);
+    printf("  [%s] Creating XSK socket (queue 0)...\n", ctx->ifname);
+    ret = xsk_socket__create(&ctx->xsk, ctx->ifname, 0, ctx->umem, &ctx->rx, &ctx->tx, &xcfg);
     if (ret) {
-        fprintf(stderr, "[%s] xsk_socket__create failed: %d (%s)\n", ifname, ret, strerror(-ret));
+        fprintf(stderr, "[%s] xsk_socket__create failed: %d (%s)\n", ctx->ifname, ret, strerror(-ret));
         xsk_umem__delete(ctx->umem);
         munmap(ctx->umem_area, sz);
         return -1;
@@ -219,9 +224,9 @@ static int xsk_setup(struct xsk_ctx *ctx, const char *ifname) {
     // Register XSK in this interface's map (key=0, queue 0)
     int fd = xsk_socket__fd(ctx->xsk);
     uint32_t key = 0;
-    printf("  [%s] Registering XSK fd=%d in map (key=%u)...\n", ifname, fd, key);
+    printf("  [%s] Registering XSK fd=%d in map (key=%u)...\n", ctx->ifname, fd, key);
     if (bpf_map_update_elem(ctx->xsks_map_fd, &key, &fd, 0) < 0) {
-        fprintf(stderr, "[%s] Failed to update xsks_map: %s\n", ifname, strerror(errno));
+        fprintf(stderr, "[%s] Failed to update xsks_map: %s\n", ctx->ifname, strerror(errno));
     }
 
     uint32_t idx = 0;
