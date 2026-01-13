@@ -1,5 +1,5 @@
 // tunnel_node.c - L2 tunnel with AF_XDP load balancing (no encryption)
-// FIXED: queue mapping, MAC rewrite, replay disabled, TX lock
+// Each interface has its own BPF object + xsks_map (proper multi-interface AF_XDP)
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,9 +38,9 @@ struct xsk_ctx {
     int ifidx;
     char ifname[16];
     uint8_t local_mac[6];
-    struct bpf_object *bpf_obj;
-    int xdp_prog_fd;
-    pthread_spinlock_t tx_lock;  // FIX: TX thread-safe
+    struct bpf_object *bpf_obj;  // each interface has own BPF
+    int xsks_map_fd;
+    pthread_spinlock_t tx_lock;
 };
 
 struct wan_ctx {
@@ -76,13 +76,6 @@ static void get_mac(const char *ifname, uint8_t *mac) {
     }
 }
 
-// Set NIC to single queue (fix rx_queue_index issue)
-static void set_single_queue(const char *ifname) {
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "ethtool -L %s combined 1 2>/dev/null", ifname);
-    (void)system(cmd);
-}
-
 static uint32_t flow_hash(const uint8_t *pkt, int len) {
     if (len < ETH_HLEN + 20) return 0;
     const struct iphdr *ip = (void*)(pkt + ETH_HLEN);
@@ -97,15 +90,21 @@ static uint32_t flow_hash(const uint8_t *pkt, int len) {
     return h;
 }
 
-static int load_xdp_program(struct xsk_ctx *ctx) {
+// Load and attach BPF for ONE interface
+static int load_xdp_for_iface(struct xsk_ctx *ctx) {
+    printf("  [%s] Opening BPF object...\n", ctx->ifname);
+
+    // Each interface loads its own BPF object
     ctx->bpf_obj = bpf_object__open_file("tunnel.bpf.o", NULL);
     if (libbpf_get_error(ctx->bpf_obj)) {
-        fprintf(stderr, "Failed to open BPF object\n");
+        fprintf(stderr, "[%s] Failed to open BPF: %ld\n", ctx->ifname, libbpf_get_error(ctx->bpf_obj));
+        ctx->bpf_obj = NULL;
         return -1;
     }
 
+    printf("  [%s] Loading BPF object...\n", ctx->ifname);
     if (bpf_object__load(ctx->bpf_obj)) {
-        fprintf(stderr, "Failed to load BPF object\n");
+        fprintf(stderr, "[%s] Failed to load BPF (errno=%d: %s)\n", ctx->ifname, errno, strerror(errno));
         bpf_object__close(ctx->bpf_obj);
         ctx->bpf_obj = NULL;
         return -1;
@@ -113,18 +112,36 @@ static int load_xdp_program(struct xsk_ctx *ctx) {
 
     struct bpf_program *prog = bpf_object__find_program_by_name(ctx->bpf_obj, "xdp_sock_prog");
     if (!prog) {
-        fprintf(stderr, "Failed to find XDP program\n");
+        fprintf(stderr, "[%s] Failed to find XDP program\n", ctx->ifname);
         bpf_object__close(ctx->bpf_obj);
         ctx->bpf_obj = NULL;
         return -1;
     }
+    int prog_fd = bpf_program__fd(prog);
+    printf("  [%s] XDP prog_fd=%d\n", ctx->ifname, prog_fd);
 
-    ctx->xdp_prog_fd = bpf_program__fd(prog);
+    struct bpf_map *map = bpf_object__find_map_by_name(ctx->bpf_obj, "xsks_map");
+    if (!map) {
+        fprintf(stderr, "[%s] Failed to find xsks_map\n", ctx->ifname);
+        bpf_object__close(ctx->bpf_obj);
+        ctx->bpf_obj = NULL;
+        return -1;
+    }
+    ctx->xsks_map_fd = bpf_map__fd(map);
+    printf("  [%s] xsks_map_fd=%d\n", ctx->ifname, ctx->xsks_map_fd);
 
-    // Try native mode first, fallback to SKB (use older API for compatibility)
-    if (bpf_set_link_xdp_fd(ctx->ifidx, ctx->xdp_prog_fd, XDP_FLAGS_DRV_MODE) < 0) {
-        if (bpf_set_link_xdp_fd(ctx->ifidx, ctx->xdp_prog_fd, XDP_FLAGS_SKB_MODE) < 0) {
-            fprintf(stderr, "Failed to attach XDP to %s\n", ctx->ifname);
+    // Detach any existing XDP first
+    bpf_set_link_xdp_fd(ctx->ifidx, -1, 0);
+
+    // Attach XDP to this interface
+    printf("  [%s] Attaching XDP (ifidx=%d)...\n", ctx->ifname, ctx->ifidx);
+    int err = bpf_set_link_xdp_fd(ctx->ifidx, prog_fd, XDP_FLAGS_DRV_MODE);
+    if (err < 0) {
+        printf("  [%s] Native mode failed (err=%d), trying SKB...\n", ctx->ifname, err);
+        err = bpf_set_link_xdp_fd(ctx->ifidx, prog_fd, XDP_FLAGS_SKB_MODE);
+        if (err < 0) {
+            fprintf(stderr, "[%s] Failed to attach XDP (err=%d, errno=%d: %s)\n",
+                    ctx->ifname, err, errno, strerror(errno));
             bpf_object__close(ctx->bpf_obj);
             ctx->bpf_obj = NULL;
             return -1;
@@ -141,22 +158,27 @@ static int xsk_setup(struct xsk_ctx *ctx, const char *ifname) {
     memset(ctx, 0, sizeof(*ctx));
     strncpy(ctx->ifname, ifname, 15);
     ctx->ifidx = if_nametoindex(ifname);
-    if (!ctx->ifidx) return -1;
+    if (!ctx->ifidx) {
+        fprintf(stderr, "[%s] Interface not found\n", ifname);
+        return -1;
+    }
 
     get_mac(ifname, ctx->local_mac);
     pthread_spin_init(&ctx->tx_lock, PTHREAD_PROCESS_PRIVATE);
 
-    // FIX: Set single queue to match xsks_map key=0
-    set_single_queue(ifname);
-
-    if (load_xdp_program(ctx) < 0) return -1;
-
-    struct bpf_map *map = bpf_object__find_map_by_name(ctx->bpf_obj, "xsks_map");
-    int xsks_map_fd = map ? bpf_map__fd(map) : -1;
+    // Load BPF for this interface
+    if (load_xdp_for_iface(ctx) < 0) {
+        fprintf(stderr, "[%s] load_xdp_for_iface failed\n", ifname);
+        return -1;
+    }
 
     size_t sz = NUM_FRAMES * FRAME_SIZE;
+    printf("  [%s] Allocating UMEM (%zu bytes)...\n", ifname, sz);
     ctx->umem_area = mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if (ctx->umem_area == MAP_FAILED) return -1;
+    if (ctx->umem_area == MAP_FAILED) {
+        fprintf(stderr, "[%s] mmap failed: %s\n", ifname, strerror(errno));
+        return -1;
+    }
 
     struct xsk_umem_config ucfg = {
         .fill_size = 4096,
@@ -166,7 +188,10 @@ static int xsk_setup(struct xsk_ctx *ctx, const char *ifname) {
         .flags = 0
     };
 
-    if (xsk_umem__create(&ctx->umem, ctx->umem_area, sz, &ctx->fq, &ctx->cq, &ucfg)) {
+    printf("  [%s] Creating UMEM...\n", ifname);
+    int ret = xsk_umem__create(&ctx->umem, ctx->umem_area, sz, &ctx->fq, &ctx->cq, &ucfg);
+    if (ret) {
+        fprintf(stderr, "[%s] umem create failed: %d (%s)\n", ifname, ret, strerror(-ret));
         munmap(ctx->umem_area, sz);
         return -1;
     }
@@ -182,21 +207,21 @@ static int xsk_setup(struct xsk_ctx *ctx, const char *ifname) {
         .bind_flags = XDP_USE_NEED_WAKEUP
     };
 
-    int ret = xsk_socket__create(&ctx->xsk, ifname, 0, ctx->umem, &ctx->rx, &ctx->tx, &xcfg);
+    printf("  [%s] Creating XSK socket (queue 0)...\n", ifname);
+    ret = xsk_socket__create(&ctx->xsk, ifname, 0, ctx->umem, &ctx->rx, &ctx->tx, &xcfg);
     if (ret) {
-        fprintf(stderr, "xsk_socket__create(%s) failed: %d\n", ifname, ret);
+        fprintf(stderr, "[%s] xsk_socket__create failed: %d (%s)\n", ifname, ret, strerror(-ret));
         xsk_umem__delete(ctx->umem);
         munmap(ctx->umem_area, sz);
         return -1;
     }
 
-    // FIX: Register XSK with key=0 (matching single queue)
-    if (xsks_map_fd >= 0) {
-        int fd = xsk_socket__fd(ctx->xsk);
-        uint32_t key = 0;
-        if (bpf_map_update_elem(xsks_map_fd, &key, &fd, 0) < 0) {
-            fprintf(stderr, "Failed to update xsks_map\n");
-        }
+    // Register XSK in this interface's map (key=0, queue 0)
+    int fd = xsk_socket__fd(ctx->xsk);
+    uint32_t key = 0;
+    printf("  [%s] Registering XSK fd=%d in map (key=%u)...\n", ifname, fd, key);
+    if (bpf_map_update_elem(ctx->xsks_map_fd, &key, &fd, 0) < 0) {
+        fprintf(stderr, "[%s] Failed to update xsks_map: %s\n", ifname, strerror(errno));
     }
 
     uint32_t idx = 0;
@@ -226,7 +251,6 @@ static void xsk_cleanup(struct xsk_ctx *ctx) {
     pthread_spin_destroy(&ctx->tx_lock);
 }
 
-// FIX: TX with spinlock for thread-safety
 static void xsk_tx(struct xsk_ctx *ctx, const void *data, int len) {
     pthread_spin_lock(&ctx->tx_lock);
 
@@ -371,24 +395,17 @@ static void *wan_rx_loop(void *arg) {
                 continue;
             }
 
-            // FIX: Replay check DISABLED for multipath (reordering expected)
-            // Will re-enable with sliding window when adding encryption
-
             uint16_t inner_len = ntohs(hdr->inner_len);
             if (len < ETH_HLEN + TUN_HDR_SIZE + inner_len || inner_len < ETH_HLEN) {
                 free_frame(ctx, addr);
                 continue;
             }
 
-            // Get inner packet
+            // Get inner packet and send to LAN
             uint8_t *inner = pkt + ETH_HLEN + TUN_HDR_SIZE;
-
-            // FIX: Rewrite MAC header before sending to LAN
-            // Keep original dst MAC (client), rewrite src to LAN interface MAC
             memcpy(out, inner, inner_len);
             struct ethhdr *out_eth = (void*)out;
-            // dst MAC stays as-is (original destination)
-            // src MAC = LAN interface MAC (so switch learns correctly)
+            // Rewrite src MAC to LAN interface MAC
             memcpy(out_eth->h_source, lan_ctx.local_mac, 6);
 
             xsk_tx(&lan_ctx, out, inner_len);
@@ -435,7 +452,7 @@ int main(int argc, char **argv) {
 
     const char *lan_if = argv[1];
 
-    // Parse WAN
+    // Parse WAN args first
     for (int i = 2; i < argc && wan_cnt < MAX_WAN; i++) {
         if (!strchr(argv[i], '@')) continue;
         char ifname[16];
@@ -443,7 +460,6 @@ int main(int argc, char **argv) {
         if (parse_wan_arg(argv[i], ifname, peer_mac) == 0) {
             int ifidx = if_nametoindex(ifname);
             if (ifidx) {
-                wan[wan_cnt].xsk.ifidx = ifidx;
                 strncpy(wan[wan_cnt].xsk.ifname, ifname, 15);
                 memcpy(wan[wan_cnt].peer_mac, peer_mac, 6);
                 wan_cnt++;
@@ -453,14 +469,15 @@ int main(int argc, char **argv) {
 
     if (wan_cnt == 0) { fprintf(stderr, "No WAN\n"); return 1; }
 
+    // Setup LAN
     printf("Setting up LAN: %s\n", lan_if);
-    strncpy(lan_ctx.ifname, lan_if, 15);
-    lan_ctx.ifidx = if_nametoindex(lan_if);
     if (xsk_setup(&lan_ctx, lan_if) < 0) {
         fprintf(stderr, "LAN setup failed\n");
+        cleanup_all();
         return 1;
     }
 
+    // Setup WANs
     pthread_t wan_threads[MAX_WAN];
     int wan_ok = 0;
 
@@ -487,7 +504,10 @@ int main(int argc, char **argv) {
     pthread_t lan_thread;
     pthread_create(&lan_thread, NULL, lan_rx_loop, NULL);
 
-    printf("Tunnel running (NO ENCRYPTION, NO REPLAY CHECK). Ctrl+C to stop.\n");
+    printf("Tunnel running (NO ENCRYPTION). Ctrl+C to stop.\n");
+    printf("  LAN: %s\n", lan_if);
+    for (int i = 0; i < wan_cnt; i++)
+        printf("  WAN[%d]: %s\n", i, wan[i].xsk.ifname);
 
     while (run) sleep(1);
 
@@ -502,4 +522,3 @@ int main(int argc, char **argv) {
     printf("Done.\n");
     return 0;
 }
-
