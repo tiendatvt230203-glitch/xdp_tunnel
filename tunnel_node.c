@@ -415,9 +415,30 @@ static void cleanup(void) {
     }
 }
 
+// Parse wan@mac format
+static int parse_wan_arg(const char *arg, char *ifname, uint8_t *peer_mac) {
+    char buf[64];
+    strncpy(buf, arg, 63);
+    buf[63] = 0;
+
+    char *at = strchr(buf, '@');
+    if (!at) return -1;
+
+    *at = 0;
+    strncpy(ifname, buf, 15);
+    ifname[15] = 0;
+
+    unsigned int m[6];
+    if (sscanf(at + 1, "%x:%x:%x:%x:%x:%x", &m[0],&m[1],&m[2],&m[3],&m[4],&m[5]) != 6)
+        return -1;
+    for (int i = 0; i < 6; i++) peer_mac[i] = m[i];
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 4) {
-        fprintf(stderr, "Usage: %s <lan_if> <wan1> [wan2...] [-k keyfile] [-p peer_mac]\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <lan_if> <wan1@peer_mac1> [wan2@peer_mac2...] [-k keyfile]\n", argv[0]);
+        fprintf(stderr, "Example: %s enp7s0 enp4s0@20:7c:14:f8:0d:4d enp5s0@20:7c:14:f8:0d:4e\n", argv[0]);
         return 1;
     }
 
@@ -426,23 +447,22 @@ int main(int argc, char **argv) {
 
     const char *lan_if = argv[1];
     const char *keyfile = "tunnel.key";
-    uint8_t peer_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-k") == 0 && i+1 < argc) {
             keyfile = argv[++i];
-        } else if (strcmp(argv[i], "-p") == 0 && i+1 < argc) {
-            unsigned int m[6];
-            if (sscanf(argv[++i], "%x:%x:%x:%x:%x:%x", &m[0],&m[1],&m[2],&m[3],&m[4],&m[5]) == 6)
-                for (int j = 0; j < 6; j++) peer_mac[j] = m[j];
-        } else if (wan_cnt < MAX_WAN) {
-            int ifidx = if_nametoindex(argv[i]);
-            if (ifidx) {
-                memset(&wan[wan_cnt], 0, sizeof(wan[wan_cnt]));
-                wan[wan_cnt].xsk.ifidx = ifidx;
-                get_mac(argv[i], wan[wan_cnt].local_mac);
-                memcpy(wan[wan_cnt].peer_mac, peer_mac, 6);
-                wan_cnt++;
+        } else if (wan_cnt < MAX_WAN && strchr(argv[i], '@')) {
+            char ifname[16];
+            uint8_t peer_mac[6];
+            if (parse_wan_arg(argv[i], ifname, peer_mac) == 0) {
+                int ifidx = if_nametoindex(ifname);
+                if (ifidx) {
+                    memset(&wan[wan_cnt], 0, sizeof(wan[wan_cnt]));
+                    wan[wan_cnt].xsk.ifidx = ifidx;
+                    get_mac(ifname, wan[wan_cnt].local_mac);
+                    memcpy(wan[wan_cnt].peer_mac, peer_mac, 6);
+                    wan_cnt++;
+                }
             }
         }
     }
