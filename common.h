@@ -1,17 +1,20 @@
-CC = gcc
-CLANG = clang
-CFLAGS = -O2 -Wall -pthread
-LDFLAGS = -lbpf -lxdp -lpthread
+#ifndef COMMON_H
+#define COMMON_H
 
-all: tunnel.bpf.o tunnel_daemon
+#include <stdint.h>
 
-tunnel.bpf.o: tunnel.bpf.c
-        $(CLANG) -O2 -g -target bpf -c $< -o $@
+#define TUNNEL_MAGIC    0x544E4C31
+#define CUSTOM_ETHERTYPE 0x88B5
+#define MAX_TUN         4
+#define NUM_FRAMES      4096
+#define FRAME_SIZE      XSK_UMEM__DEFAULT_FRAME_SIZE
+#define BATCH_SIZE      64
 
-tunnel_daemon: tunnel_daemon.c common.h
-        $(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+struct tunnel_hdr {
+    uint32_t magic;
+    uint16_t msg_id;
+    uint8_t  part;
+    uint8_t  total;
+} __attribute__((packed));
 
-clean:
-        rm -f tunnel.bpf.o tunnel_daemon
-
-.PHONY: all clean
+#endif

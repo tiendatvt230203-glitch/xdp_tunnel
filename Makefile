@@ -1,7 +1,7 @@
 CC = gcc
 CLANG = clang
 CFLAGS = -O2 -Wall -pthread
-LDFLAGS = -lbpf -lxdp -lpthread -lssl -lcrypto
+LDFLAGS = -lbpf -lxdp -lpthread
 
 all: tunnel.bpf.o tunnel_daemon
 
