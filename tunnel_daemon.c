@@ -1,479 +1,314 @@
-// tunnel_daemon.c - Multi-queue AF_XDP LB (OPTIMIZED 95%)
-#define _GNU_SOURCE
+// tunnel_lb.c - VXLAN Load Balancer (ECMP-style flow hash)
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
 #include <pthread.h>
 #include <poll.h>
-#include <sched.h>
-#include <time.h>
-#include <dirent.h>
+#include <stdatomic.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <net/if.h>
-#include <linux/if_link.h>
+#include <linux/if_packet.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <arpa/inet.h>
-#include <bpf/bpf.h>
-#include <bpf/libbpf.h>
-#include <xdp/xsk.h>
-#include <xdp/libxdp.h>
 
-#define MAX_TUN       4
-#define MAX_QUEUES    16
-#define NUM_FRAMES    4096
-#define FRAME_SIZE    XSK_UMEM__DEFAULT_FRAME_SIZE
-#define BATCH_SIZE    64
-#define MAGIC         0x544E4C31
-#define ETYPE         0x88B5
-#define REASM_SLOTS   64
-#define REASM_TICKS   200  // ~2s với poll 10ms
+#define MAX_TUN 4
+#define MAX_PKT 4096
+#define SPLIT_TH 1500
+#define TUN_ETYPE 0x88B5
+#define MAGIC 0x53504C54
+#define REASM_SLOTS 128
 
-struct hdr { uint32_t magic; uint16_t id; uint8_t part, total; } __attribute__((packed));
-struct pool { uint64_t f[NUM_FRAMES]; uint32_t h, t; };
+struct hdr {
+    uint32_t magic;
+    uint16_t id;
+    uint8_t part;
+    uint8_t total;
+} __attribute__((packed));
 
-struct xsk {
-    struct xsk_socket *sk;
-    struct xsk_umem *umem;
-    void *mem;
-    struct xsk_ring_prod fq, tx;
-    struct xsk_ring_cons cq, rx;
-    struct pool pool;
-    int tx_pending;
-};
-
-struct iface {
-    int ifidx;
+struct tun {
     char name[16];
-    int num_queues;
-    struct xsk xsks[MAX_QUEUES];
-    struct xdp_program *prog;
-    int map_fd;
+    int fd;
+    int ifidx;
+    uint8_t peer[6];
+    atomic_uint_fast64_t tx_bytes;  // Stats only
+    atomic_uint_fast64_t tx_pkts;
 };
 
-// Per-thread reasm slot (không race)
-struct reasm_slot { uint16_t id; uint32_t tick; uint8_t b[2][2048]; int l[2]; };
-
-static struct iface lan;
-static struct iface tun[MAX_TUN];
-static int tun_cnt;
+static int lan_fd = -1, lan_ifidx = 0;
+static struct tun tuns[MAX_TUN];
+static int tun_cnt = 0;
+static atomic_uint msg_id = 1;
 static volatile int run = 1;
+
+struct reasm_slot {
+    uint16_t id;
+    uint8_t buf[2][MAX_PKT];
+    int len[2];
+};
+
+static struct reasm_slot reasm[REASM_SLOTS];
+static pthread_spinlock_t reasm_lock;
 
 static void stop(int s) { (void)s; run = 0; }
 
-static void pin_cpu(int cpu) {
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cpu % sysconf(_SC_NPROCESSORS_ONLN), &set);
-    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+static int get_ifidx(const char *n) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return -1;
+    struct ifreq i;
+    memset(&i, 0, sizeof(i));
+    strncpy(i.ifr_name, n, IFNAMSIZ - 1);
+    if (ioctl(s, SIOCGIFINDEX, &i) < 0) { close(s); return -1; }
+    close(s);
+    return i.ifr_ifindex;
 }
 
-static int get_num_queues(int ifidx) {
-    char name[16], path[128];
-    if (!if_indextoname(ifidx, name)) return 1;
-    snprintf(path, sizeof(path), "/sys/class/net/%s/queues", name);
-    DIR *dir = opendir(path);
-    if (!dir) return 1;
-    int cnt = 0;
-    struct dirent *ent;
-    while ((ent = readdir(dir)))
-        if (strncmp(ent->d_name, "rx-", 3) == 0) cnt++;
-    closedir(dir);
-    return cnt > 0 ? (cnt > MAX_QUEUES ? MAX_QUEUES : cnt) : 1;
+static int rawsock(int ifidx) {
+    int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (fd < 0) return -1;
+    struct sockaddr_ll s;
+    memset(&s, 0, sizeof(s));
+    s.sll_family = AF_PACKET;
+    s.sll_protocol = htons(ETH_P_ALL);
+    s.sll_ifindex = ifidx;
+    if (bind(fd, (void *)&s, sizeof(s)) < 0) { close(fd); return -1; }
+    return fd;
 }
 
-// Lock-free pool (single-thread per pool)
-static void pool_init(struct pool *p) {
-    p->h = 0; p->t = NUM_FRAMES;
-    for (uint32_t i = 0; i < NUM_FRAMES; i++) p->f[i] = i * FRAME_SIZE;
+static void send_raw(int fd, int ifidx, const uint8_t dst[6], const void *buf, int len) {
+    struct sockaddr_ll s;
+    memset(&s, 0, sizeof(s));
+    s.sll_family = AF_PACKET;
+    s.sll_ifindex = ifidx;
+    s.sll_halen = 6;
+    memcpy(s.sll_addr, dst, 6);
+    sendto(fd, buf, len, 0, (void *)&s, sizeof(s));
 }
 
-static uint64_t pool_get(struct pool *p) {
-    if (p->h == p->t) return UINT64_MAX;
-    return p->f[p->h++ % NUM_FRAMES];
+// Per-packet round-robin counter
+static atomic_uint rr_counter = 0;
+
+// Round-robin per packet - mỗi packet đi tunnel khác nhau
+static inline int pick_tunnel(const uint8_t *frame, int len) {
+    (void)frame;
+    (void)len;
+    return atomic_fetch_add(&rr_counter, 1) % tun_cnt;
 }
 
-static void pool_put(struct pool *p, uint64_t a) {
-    p->f[p->t++ % NUM_FRAMES] = a;
-}
+static void lan_rx(const uint8_t *frame, int len) {
+    if (len < ETH_HLEN) return;
 
-static int setup_xsk_socket(struct xsk *x, const char *ifname, int qid) {
-    memset(x, 0, sizeof(*x));
-    size_t sz = NUM_FRAMES * FRAME_SIZE;
-    if (posix_memalign(&x->mem, getpagesize(), sz)) return -1;
+    int t = pick_tunnel(frame, len);
 
-    struct xsk_umem_config uc = {
-        .fill_size = NUM_FRAMES, .comp_size = NUM_FRAMES,
-        .frame_size = FRAME_SIZE,
-        .frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
-        .flags = 0,
-    };
-    if (xsk_umem__create(&x->umem, x->mem, sz, &x->fq, &x->cq, &uc)) return -1;
+    uint8_t out[MAX_PKT + 64];
+    struct ethhdr *e = (void *)out;
+    struct hdr *h = (void *)(out + ETH_HLEN);
 
-    pool_init(&x->pool);
-
-    struct xsk_socket_config sc = {
-        .rx_size = NUM_FRAMES, .tx_size = NUM_FRAMES,
-        .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
-        .xdp_flags = XDP_FLAGS_DRV_MODE,
-        .bind_flags = XDP_USE_NEED_WAKEUP | XDP_ZEROCOPY,
-    };
-    if (xsk_socket__create(&x->sk, ifname, qid, x->umem, &x->rx, &x->tx, &sc)) {
-        sc.bind_flags = XDP_USE_NEED_WAKEUP;  // fallback no zerocopy
-        sc.xdp_flags = XDP_FLAGS_DRV_MODE;
-        if (xsk_socket__create(&x->sk, ifname, qid, x->umem, &x->rx, &x->tx, &sc)) {
-            sc.xdp_flags = XDP_FLAGS_SKB_MODE;
-            if (xsk_socket__create(&x->sk, ifname, qid, x->umem, &x->rx, &x->tx, &sc)) return -1;
-        }
-    }
-
-    __u32 idx;
-    int n = NUM_FRAMES / 2;
-    if (xsk_ring_prod__reserve(&x->fq, n, &idx) != (unsigned)n) return -1;
-    for (int i = 0; i < n; i++) *xsk_ring_prod__fill_addr(&x->fq, idx++) = pool_get(&x->pool);
-    xsk_ring_prod__submit(&x->fq, n);
-
-    return 0;
-}
-
-static int setup_iface(struct iface *ifc, int ifidx, int max_queues) {
-    memset(ifc, 0, sizeof(*ifc));
-    ifc->ifidx = ifidx;
-    if (!if_indextoname(ifidx, ifc->name)) return -1;
-
-    int detected = get_num_queues(ifidx);
-    ifc->num_queues = (max_queues > 0 && max_queues < detected) ? max_queues : detected;
-
-    ifc->prog = xdp_program__open_file("tunnel.bpf.o", "xdp", NULL);
-    if (!ifc->prog) return -1;
-    if (xdp_program__attach(ifc->prog, ifidx, XDP_MODE_NATIVE, 0))
-        if (xdp_program__attach(ifc->prog, ifidx, XDP_MODE_SKB, 0)) return -1;
-
-    struct bpf_map *m = bpf_object__find_map_by_name(xdp_program__bpf_obj(ifc->prog), "xsks_map");
-    if (!m) return -1;
-    ifc->map_fd = bpf_map__fd(m);
-
-    for (int q = 0; q < ifc->num_queues; q++) {
-        if (setup_xsk_socket(&ifc->xsks[q], ifc->name, q)) return -1;
-        int key = q, val = xsk_socket__fd(ifc->xsks[q].sk);
-        bpf_map_update_elem(ifc->map_fd, &key, &val, BPF_ANY);
-    }
-    return 0;
-}
-
-static void complete_tx(struct xsk *x) {
-    __u32 idx;
-    unsigned n = xsk_ring_cons__peek(&x->cq, BATCH_SIZE, &idx);
-    for (unsigned i = 0; i < n; i++)
-        pool_put(&x->pool, *xsk_ring_cons__comp_addr(&x->cq, idx++));
-    if (n) xsk_ring_cons__release(&x->cq, n);
-}
-
-static void tx_flush(struct xsk *x) {
-    if (x->tx_pending && xsk_ring_prod__needs_wakeup(&x->tx))
-        sendto(xsk_socket__fd(x->sk), 0, 0, MSG_DONTWAIT, 0, 0);
-    x->tx_pending = 0;
-}
-
-// Zero-copy TX: trả về pointer trực tiếp vào TX frame
-static void *tx_alloc(struct xsk *x, uint64_t *addr_out) {
-    uint64_t a = pool_get(&x->pool);
-    if (a == UINT64_MAX) return NULL;
-    *addr_out = a;
-    return x->mem + a;
-}
-
-static int tx_submit(struct xsk *x, uint64_t addr, int len) {
-    __u32 idx;
-    if (xsk_ring_prod__reserve(&x->tx, 1, &idx) != 1) {
-        pool_put(&x->pool, addr);
-        return -1;
-    }
-    struct xdp_desc *d = xsk_ring_prod__tx_desc(&x->tx, idx);
-    d->addr = addr;
-    d->len = len;
-    xsk_ring_prod__submit(&x->tx, 1);
-    x->tx_pending++;
-    if (x->tx_pending >= BATCH_SIZE) tx_flush(x);
-    return 0;
-}
-
-static void refill_fq(struct xsk *x, uint64_t *a, int n) {
-    __u32 idx;
-    if (xsk_ring_prod__reserve(&x->fq, n, &idx) == (unsigned)n) {
-        for (int i = 0; i < n; i++)
-            *xsk_ring_prod__fill_addr(&x->fq, idx++) = a[i];
-        xsk_ring_prod__submit(&x->fq, n);
-    } else {
-        for (int i = 0; i < n; i++) pool_put(&x->pool, a[i]);
-    }
-}
-
-static uint32_t jenkins_hash(const uint8_t *key, size_t len) {
-    uint32_t h = 0;
-    for (size_t i = 0; i < len; i++) { h += key[i]; h += h << 10; h ^= h >> 6; }
-    h += h << 3; h ^= h >> 11; h += h << 15;
-    return h;
-}
-
-static uint32_t hash_pkt(void *p, int len) {
-    struct ethhdr *e = p;
-    uint8_t key[36];
-    int klen = 0;
-    memcpy(key, e->h_source, 6); klen += 6;
-    memcpy(key + klen, e->h_dest, 6); klen += 6;
-    if (ntohs(e->h_proto) == ETH_P_IP && len >= ETH_HLEN + 20) {
-        struct iphdr *ip = p + ETH_HLEN;
-        memcpy(key + klen, &ip->saddr, 4); klen += 4;
-        memcpy(key + klen, &ip->daddr, 4); klen += 4;
-        key[klen++] = ip->protocol;
-        if (len >= ETH_HLEN + ip->ihl * 4 + 4)
-            memcpy(key + klen, p + ETH_HLEN + ip->ihl * 4, 4), klen += 4;
-    }
-    return jenkins_hash(key, klen);
-}
-
-// Thread context
-struct thread_ctx {
-    struct iface *ifc;
-    int qid;
-    int cpu;
-    int is_lan;
-    int tunnel_id;    // -1 nếu LAN, 0..tun_cnt-1 nếu tunnel
-    uint16_t msg_id;  // Per-thread msg_id
-    uint32_t tick;    // Per-thread tick counter
-    struct reasm_slot reasm[REASM_SLOTS];  // Per-thread reasm
-};
-
-// LAN -> VXLAN: Zero-copy, single-producer (src_qid based)
-static void proc_lan(struct thread_ctx *ctx, void *p, int len) {
-    if (len < ETH_HLEN || !tun_cnt) return;
-
-    uint32_t h = hash_pkt(p, len);
-    int t = h % tun_cnt;
-    // Single-producer: map theo src_qid (chỉ race-free nếu tun_q >= lan_q)
-    int q = ctx->qid % tun[t].num_queues;
-
-    struct xsk *tx_xsk = &tun[t].xsks[q];
-
-    // ✅ Reclaim CQ của đúng TX ring trước khi alloc
-    complete_tx(tx_xsk);
-
-    uint64_t addr;
-    void *dst = tx_alloc(tx_xsk, &addr);
-    if (!dst) return;
-
-    // Build packet trực tiếp vào TX frame (zero-copy)
-    struct ethhdr *e = dst;
-    struct hdr *hdr = (void *)((uint8_t *)dst + ETH_HLEN);
-
-    memset(e->h_dest, 0xff, 6);
+    memcpy(e->h_dest, tuns[t].peer, 6);
     memset(e->h_source, 0x02, 6);
-    e->h_proto = htons(ETYPE);
+    e->h_proto = htons(TUN_ETYPE);
 
-    hdr->magic = htonl(MAGIC);
-    hdr->id = htons((ctx->qid << 12) | (ctx->msg_id++ & 0xFFF));
-    hdr->part = 0;
-    hdr->total = 1;
+    if (len <= SPLIT_TH) {
+        h->magic = htonl(MAGIC);
+        h->id = htons(atomic_fetch_add(&msg_id, 1));
+        h->part = 0;
+        h->total = 1;
+        memcpy(out + ETH_HLEN + sizeof(*h), frame, len);
 
-    memcpy((uint8_t *)dst + ETH_HLEN + sizeof(*hdr), p, len);
-    tx_submit(tx_xsk, addr, ETH_HLEN + sizeof(*hdr) + len);
+        int out_len = ETH_HLEN + sizeof(*h) + len;
+        send_raw(tuns[t].fd, tuns[t].ifidx, tuns[t].peer, out, out_len);
 
-    // ✅ Flush đúng TX ring
-    tx_flush(tx_xsk);
-}
-
-// VXLAN -> LAN: Zero-copy, single-producer, per-thread reasm
-static void proc_tun(struct thread_ctx *ctx, void *p, int len) {
-    if (len < ETH_HLEN + (int)sizeof(struct hdr)) return;
-
-    struct ethhdr *e = p;
-    if (ntohs(e->h_proto) != ETYPE) return;
-
-    struct hdr *hdr = (void *)((uint8_t *)p + ETH_HLEN);
-    if (ntohl(hdr->magic) != MAGIC) return;
-
-    int pl = len - ETH_HLEN - sizeof(*hdr);
-    void *pay = (uint8_t *)p + ETH_HLEN + sizeof(*hdr);
-    if (pl < ETH_HLEN) return;
-
-    // ✅ Tránh tun0.q0 và tun1.q0 cùng map về lan.q0
-    int q = (ctx->tunnel_id * 997 + ctx->qid) % lan.num_queues;
-    struct xsk *tx_xsk = &lan.xsks[q];
-
-    // ✅ Reclaim CQ của đúng TX ring trước khi alloc
-    complete_tx(tx_xsk);
-
-    if (hdr->total == 1) {
-        uint64_t addr;
-        void *dst = tx_alloc(tx_xsk, &addr);
-        if (!dst) return;
-        memcpy(dst, pay, pl);
-        tx_submit(tx_xsk, addr, pl);
-        tx_flush(tx_xsk);
+        atomic_fetch_add(&tuns[t].tx_bytes, out_len);
+        atomic_fetch_add(&tuns[t].tx_pkts, 1);
         return;
     }
 
-    if (hdr->total != 2 || hdr->part > 1) return;
+    // Split packet > SPLIT_TH
+    int half = len / 2;
+    uint16_t id = atomic_fetch_add(&msg_id, 1);
 
-    uint16_t id = ntohs(hdr->id);
-    int s = id % REASM_SLOTS;
-    struct reasm_slot *rs = &ctx->reasm[s];
+    h->magic = htonl(MAGIC);
+    h->id = htons(id);
+    h->total = 2;
 
-    // Timeout bằng tick (không dùng time())
-    if (rs->id != id || (ctx->tick - rs->tick) > REASM_TICKS) {
-        rs->id = id;
-        rs->tick = ctx->tick;
-        rs->l[0] = rs->l[1] = 0;
-    }
+    h->part = 0;
+    memcpy(out + ETH_HLEN + sizeof(*h), frame, half);
+    int out_len = ETH_HLEN + sizeof(*h) + half;
+    send_raw(tuns[t].fd, tuns[t].ifidx, tuns[t].peer, out, out_len);
+    atomic_fetch_add(&tuns[t].tx_bytes, out_len);
+    atomic_fetch_add(&tuns[t].tx_pkts, 1);
 
-    if (pl <= 2048 && !rs->l[hdr->part]) {
-        memcpy(rs->b[hdr->part], pay, pl);
-        rs->l[hdr->part] = pl;
-    }
-
-    if (rs->l[0] && rs->l[1]) {
-        int ol = rs->l[0] + rs->l[1];
-        if (ol >= ETH_HLEN) {
-            uint64_t addr;
-            void *dst = tx_alloc(tx_xsk, &addr);
-            if (dst) {
-                memcpy(dst, rs->b[0], rs->l[0]);
-                memcpy((uint8_t *)dst + rs->l[0], rs->b[1], rs->l[1]);
-                tx_submit(tx_xsk, addr, ol);
-                tx_flush(tx_xsk);
-            }
-        }
-        rs->l[0] = rs->l[1] = 0;
-    }
+    h->part = 1;
+    memcpy(out + ETH_HLEN + sizeof(*h), frame + half, len - half);
+    out_len = ETH_HLEN + sizeof(*h) + (len - half);
+    send_raw(tuns[t].fd, tuns[t].ifidx, tuns[t].peer, out, out_len);
+    atomic_fetch_add(&tuns[t].tx_bytes, out_len);
+    atomic_fetch_add(&tuns[t].tx_pkts, 1);
 }
 
-static void *rx_thread(void *arg) {
-    struct thread_ctx *ctx = arg;
-    pin_cpu(ctx->cpu);
+static void tun_rx(const uint8_t *pkt, int len, int tidx) {
+    if (len < ETH_HLEN + (int)sizeof(struct hdr)) return;
 
-    struct xsk *x = &ctx->ifc->xsks[ctx->qid];
-    struct pollfd pf = { xsk_socket__fd(x->sk), POLLIN, 0 };
-    uint64_t addrs[BATCH_SIZE];
+    const struct ethhdr *e = (const void *)pkt;
+    if (ntohs(e->h_proto) != TUN_ETYPE) return;
 
-    while (run) {
-        // Poll với timeout nhỏ (10ms) hoặc busy-poll
-        int ret = poll(&pf, 1, 10);
-        ctx->tick++;  // Tick counter cho reasm timeout
+    const struct hdr *h = (const void *)(pkt + ETH_HLEN);
+    if (ntohl(h->magic) != MAGIC) return;
 
-        // ✅ Không complete_tx(x) ở đây - proc_* đã gọi đúng TX ring
+    int total = h->total;
+    int part = h->part;
+    uint16_t id = ntohs(h->id);
+    int plen = len - ETH_HLEN - sizeof(*h);
+    const uint8_t *payload = pkt + ETH_HLEN + sizeof(*h);
 
-        __u32 idx;
-        unsigned n = xsk_ring_cons__peek(&x->rx, BATCH_SIZE, &idx);
+    (void)tidx;
+    if (plen < 6) return;
 
-        // Busy-poll: nếu có data, tiếp tục không cần poll
-        if (!n && ret <= 0) continue;
-
-        int cnt = 0;
-        for (unsigned i = 0; i < n; i++) {
-            struct xdp_desc *d = xsk_ring_cons__rx_desc(&x->rx, idx++);
-            void *pkt = x->mem + d->addr;
-
-            if (((struct ethhdr*)pkt)->h_source[0] != 0x02) {
-                if (ctx->is_lan) proc_lan(ctx, pkt, d->len);
-                else proc_tun(ctx, pkt, d->len);
-            }
-            addrs[cnt++] = d->addr;
-        }
-
-        xsk_ring_cons__release(&x->rx, n);
-        refill_fq(x, addrs, cnt);
-
-        // ✅ Không flush ở đây - proc_* đã flush đúng TX ring
+    if (total == 1) {
+        const uint8_t *dst = payload;
+        send_raw(lan_fd, lan_ifidx, dst, payload, plen);
+        return;
     }
 
-    free(ctx);
+    if (total != 2 || part > 1) return;
+
+    int slot = id % REASM_SLOTS;
+
+    pthread_spin_lock(&reasm_lock);
+    struct reasm_slot *r = &reasm[slot];
+
+    if (r->id != id) {
+        r->id = id;
+        r->len[0] = r->len[1] = 0;
+    }
+
+    if (plen <= MAX_PKT && r->len[part] == 0) {
+        memcpy(r->buf[part], payload, plen);
+        r->len[part] = plen;
+    }
+
+    if (r->len[0] && r->len[1]) {
+        uint8_t out[MAX_PKT * 2];
+        int outlen = r->len[0] + r->len[1];
+        memcpy(out, r->buf[0], r->len[0]);
+        memcpy(out + r->len[0], r->buf[1], r->len[1]);
+        r->len[0] = r->len[1] = 0;
+        pthread_spin_unlock(&reasm_lock);
+
+        const uint8_t *dst = out;
+        send_raw(lan_fd, lan_ifidx, dst, out, outlen);
+        return;
+    }
+
+    pthread_spin_unlock(&reasm_lock);
+}
+
+static void *lan_loop(void *x) {
+    (void)x;
+    uint8_t b[MAX_PKT];
+    while (run) {
+        ssize_t n = recv(lan_fd, b, sizeof(b), 0);
+        if (n <= 0) continue;
+        if (n >= ETH_HLEN && ((struct ethhdr *)b)->h_source[0] == 0x02) continue;
+        lan_rx(b, (int)n);
+    }
     return NULL;
 }
 
-static void cleanup_xsk(struct xsk *x) {
-    if (x->sk) xsk_socket__delete(x->sk);
-    if (x->umem) xsk_umem__delete(x->umem);
-    if (x->mem) free(x->mem);
+static void *tun_loop(void *x) {
+    (void)x;
+    struct pollfd p[MAX_TUN];
+    uint8_t b[MAX_PKT];
+    for (int i = 0; i < tun_cnt; i++) {
+        p[i].fd = tuns[i].fd;
+        p[i].events = POLLIN;
+    }
+    while (run) {
+        if (poll(p, tun_cnt, 100) <= 0) continue;
+        for (int i = 0; i < tun_cnt; i++) {
+            if (!(p[i].revents & POLLIN)) continue;
+            ssize_t n = recv(tuns[i].fd, b, sizeof(b), 0);
+            if (n <= 0) continue;
+            if (n >= ETH_HLEN && ((struct ethhdr *)b)->h_source[0] == 0x02) continue;
+            tun_rx(b, (int)n, i);
+        }
+    }
+    return NULL;
 }
 
-static void cleanup_iface(struct iface *ifc) {
-    if (ifc->prog) {
-        xdp_program__detach(ifc->prog, ifc->ifidx, XDP_MODE_NATIVE, 0);
-        xdp_program__detach(ifc->prog, ifc->ifidx, XDP_MODE_SKB, 0);
-        xdp_program__close(ifc->prog);
+static void *stats_loop(void *x) {
+    (void)x;
+    uint64_t prev_bytes[MAX_TUN] = {0};
+
+    while (run) {
+        sleep(5);
+        if (!run) break;
+
+        printf("\n=== Bandwidth Stats (5s) ===\n");
+        uint64_t total_rate = 0;
+
+        for (int i = 0; i < tun_cnt; i++) {
+            uint64_t bytes = atomic_load(&tuns[i].tx_bytes);
+            uint64_t delta = bytes - prev_bytes[i];
+            uint64_t mbps = (delta * 8) / (5 * 1000000);
+
+            printf("  %s: %3lu Mbps (%lu MB total)\n",
+                   tuns[i].name, mbps, bytes / (1024 * 1024));
+
+            prev_bytes[i] = bytes;
+            total_rate += mbps;
+        }
+        printf("  TOTAL: %lu Mbps\n", total_rate);
     }
-    for (int q = 0; q < ifc->num_queues; q++)
-        cleanup_xsk(&ifc->xsks[q]);
+    return NULL;
 }
 
 int main(int c, char **v) {
     if (c < 3) {
-        printf("Usage: %s <lan_idx>[:<queues>] <vxlan_idx>[:<queues>] ...\n", v[0]);
-        printf("Example: %s 2:4 5:2 6:2\n", v[0]);
+        printf("Usage: %s <lan_if> <tun1> [tun2...]\n", v[0]);
+        printf("Per-packet round-robin load balancer\n");
         return 1;
     }
+
     signal(SIGINT, stop);
     signal(SIGTERM, stop);
+    pthread_spin_init(&reasm_lock, PTHREAD_PROCESS_PRIVATE);
 
-    int lan_idx, lan_q = 0;
-    if (sscanf(v[1], "%d:%d", &lan_idx, &lan_q) < 1) {
-        fprintf(stderr, "Invalid LAN\n");
-        return 1;
-    }
-    if (setup_iface(&lan, lan_idx, lan_q)) {
-        fprintf(stderr, "LAN %d fail\n", lan_idx);
-        return 1;
-    }
+    lan_ifidx = get_ifidx(v[1]);
+    if (lan_ifidx < 0) { printf("Bad lan if\n"); return 1; }
+    lan_fd = rawsock(lan_ifidx);
+    if (lan_fd < 0) { printf("LAN rawsock fail\n"); return 1; }
+    printf("[INIT] LAN=%s ifidx=%d\n", v[1], lan_ifidx);
 
     for (int i = 2; i < c && tun_cnt < MAX_TUN; i++) {
-        int idx, q = 0;
-        if (sscanf(v[i], "%d:%d", &idx, &q) < 1) continue;
-        if (!setup_iface(&tun[tun_cnt], idx, q)) tun_cnt++;
+        memset(&tuns[tun_cnt], 0, sizeof(tuns[tun_cnt]));
+        strncpy(tuns[tun_cnt].name, v[i], 15);
+        tuns[tun_cnt].ifidx = get_ifidx(v[i]);
+        if (tuns[tun_cnt].ifidx < 0) { printf("Bad tun %s\n", v[i]); continue; }
+        tuns[tun_cnt].fd = rawsock(tuns[tun_cnt].ifidx);
+        if (tuns[tun_cnt].fd < 0) { printf("Tun rawsock fail %s\n", v[i]); continue; }
+        memset(tuns[tun_cnt].peer, 0xff, 6);
+        printf("[TUN] %s ifidx=%d\n", tuns[tun_cnt].name, tuns[tun_cnt].ifidx);
+        tun_cnt++;
     }
 
-    if (!tun_cnt) {
-        fprintf(stderr, "No tunnels\n");
-        return 1;
-    }
+    if (!tun_cnt) { printf("No tunnels\n"); return 1; }
 
-    int total = lan.num_queues;
-    for (int t = 0; t < tun_cnt; t++) total += tun[t].num_queues;
+    pthread_t lan_th, tun_th, stats_th;
+    pthread_create(&lan_th, 0, lan_loop, 0);
+    pthread_create(&tun_th, 0, tun_loop, 0);
+    pthread_create(&stats_th, 0, stats_loop, 0);
 
-    pthread_t *threads = malloc(total * sizeof(pthread_t));
-    int tid = 0, cpu = 0;
-
-    for (int q = 0; q < lan.num_queues; q++) {
-        struct thread_ctx *ctx = calloc(1, sizeof(*ctx));
-        ctx->ifc = &lan;
-        ctx->qid = q;
-        ctx->cpu = cpu++;
-        ctx->is_lan = 1;
-        ctx->tunnel_id = -1;  // LAN không có tunnel_id
-        pthread_create(&threads[tid++], 0, rx_thread, ctx);
-    }
-
-    for (int t = 0; t < tun_cnt; t++) {
-        for (int q = 0; q < tun[t].num_queues; q++) {
-            struct thread_ctx *ctx = calloc(1, sizeof(*ctx));
-            ctx->ifc = &tun[t];
-            ctx->qid = q;
-            ctx->cpu = cpu++;
-            ctx->is_lan = 0;
-            ctx->tunnel_id = t;  // ✅ Để tránh race khi map về LAN queue
-            pthread_create(&threads[tid++], 0, rx_thread, ctx);
-        }
-    }
+    printf("[RUN] Per-packet round-robin LB across %d tunnels\n", tun_cnt);
 
     while (run) sleep(1);
 
-    for (int i = 0; i < total; i++) pthread_join(threads[i], 0);
-    free(threads);
-
-    cleanup_iface(&lan);
-    for (int t = 0; t < tun_cnt; t++) cleanup_iface(&tun[t]);
+    pthread_join(lan_th, 0);
+    pthread_join(tun_th, 0);
+    pthread_join(stats_th, 0);
+    pthread_spin_destroy(&reasm_lock);
 
     return 0;
 }
-
