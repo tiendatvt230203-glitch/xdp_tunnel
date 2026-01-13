@@ -447,6 +447,8 @@ static void *stats_loop(void *x) {
 
 // === XDP Program Loading ===
 
+static int xdp_flags_used = 0;
+
 static int load_xdp_program(const char *ifname) {
     char bpf_file[] = "tunnel.bpf.o";
 
@@ -478,9 +480,11 @@ static int load_xdp_program(const char *ifname) {
         return -1;
     }
 
-    // Try native mode first, fallback to SKB
-    if (bpf_xdp_attach(ifindex, xdp_prog_fd, XDP_FLAGS_DRV_MODE, NULL) < 0) {
-        if (bpf_xdp_attach(ifindex, xdp_prog_fd, XDP_FLAGS_SKB_MODE, NULL) < 0) {
+    // Try native mode first, fallback to SKB (use older API for compatibility)
+    xdp_flags_used = XDP_FLAGS_DRV_MODE;
+    if (bpf_set_link_xdp_fd(ifindex, xdp_prog_fd, xdp_flags_used) < 0) {
+        xdp_flags_used = XDP_FLAGS_SKB_MODE;
+        if (bpf_set_link_xdp_fd(ifindex, xdp_prog_fd, xdp_flags_used) < 0) {
             fprintf(stderr, "Failed to attach XDP program\n");
             bpf_object__close(bpf_obj);
             return -1;
@@ -496,7 +500,7 @@ static int load_xdp_program(const char *ifname) {
 static void unload_xdp_program(const char *ifname) {
     int ifindex = if_nametoindex(ifname);
     if (ifindex) {
-        bpf_xdp_detach(ifindex, 0, NULL);
+        bpf_set_link_xdp_fd(ifindex, -1, xdp_flags_used);
         printf("[XDP] Detached from %s\n", ifname);
     }
     if (bpf_obj) {
