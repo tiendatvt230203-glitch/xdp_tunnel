@@ -1,77 +1,54 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <signal.h>
 #include <net/if.h>
-#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <linux/if_packet.h>
-#include <linux/ip.h>
-#include <bpf/libbpf.h>
-#include <bpf/bpf.h>
+#include <linux/if_ether.h>
 #include <xdp/xsk.h>
 
-#define NUM_FRAMES  2048
-#define FRAME_SIZE  XSK_UMEM__DEFAULT_FRAME_SIZE
-#define MAX_WAN     3
+#define NUM_FRAMES 2048
+#define FRAME_SIZE XSK_UMEM__DEFAULT_FRAME_SIZE
 
 static volatile int running = 1;
-static void sig(int s) { (void)s; running = 0; }
+static void sig(int s){ (void)s; running = 0; }
 
-/* WAN config */
-static int wan_fd[MAX_WAN];
-static int wan_ifindex[MAX_WAN];
-static int num_wan;
-
-/* AF_XDP */
-static struct xsk_socket *xsk;
-static struct xsk_ring_cons rx;
-static struct xsk_umem *umem;
-static void *buf;
-
-/* VERY SIMPLE LB STATE */
-static int rr = 0;
-
-/* chọn WAN (stub – sửa sau) */
-static int select_wan(void) {
-    int w = rr;
-    rr = (rr + 1) % num_wan;
-    return w;
-}
-
-int main(int argc, char **argv)
+int main()
 {
     signal(SIGINT, sig);
     signal(SIGTERM, sig);
 
-    /* hardcode test cho gọn */
+    /* ===== CONFIG ===== */
     char *lan_if = "enp7s0";
-    char *wan_if[] = {"enp4s0","enp5s0","enp6s0"};
-    num_wan = 3;
+    char *wan_if = "enp5s0";   // ÉP CỨNG WAN
+    int wan_ifindex = if_nametoindex(wan_if);
 
-    for (int i=0;i<num_wan;i++) {
-        wan_ifindex[i] = if_nametoindex(wan_if[i]);
-        wan_fd[i] = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-        struct sockaddr_ll s = {
-            .sll_family = AF_PACKET,
-            .sll_ifindex = wan_ifindex[i],
-            .sll_protocol = htons(ETH_P_ALL),
-        };
-        bind(wan_fd[i], (void *)&s, sizeof(s));
-    }
+    /* ===== RAW SOCKET WAN ===== */
+    int wan_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    struct sockaddr_ll wan_addr = {
+        .sll_family   = AF_PACKET,
+        .sll_ifindex  = wan_ifindex,
+        .sll_protocol = htons(ETH_P_ALL),
+    };
+    bind(wan_fd, (void*)&wan_addr, sizeof(wan_addr));
 
-    /* AF_XDP init */
-    posix_memalign(&buf, getpagesize(), NUM_FRAMES*FRAME_SIZE);
+    /* ===== AF_XDP LAN ===== */
+    void *buf;
+    posix_memalign(&buf, getpagesize(), NUM_FRAMES * FRAME_SIZE);
+
+    struct xsk_umem *umem;
+    struct xsk_ring_prod fq;
+    struct xsk_ring_cons rx;
+
     struct xsk_umem_config uc = {
         .fill_size = NUM_FRAMES,
         .comp_size = NUM_FRAMES,
         .frame_size = FRAME_SIZE,
     };
-    struct xsk_ring_prod fq;
-    struct xsk_ring_cons cq;
-    xsk_umem__create(&umem, buf, NUM_FRAMES*FRAME_SIZE, &fq, &cq, &uc);
+    xsk_umem__create(&umem, buf, NUM_FRAMES*FRAME_SIZE, &fq, NULL, &uc);
 
+    struct xsk_socket *xsk;
     struct xsk_socket_config xc = {
         .rx_size = NUM_FRAMES,
         .tx_size = 0,
@@ -79,38 +56,38 @@ int main(int argc, char **argv)
     };
     xsk_socket__create(&xsk, lan_if, 0, umem, &rx, NULL, &xc);
 
-    printf("Running (bypass, no crypto)...\n");
+    /* fill ring */
+    uint32_t idx;
+    xsk_ring_prod__reserve(&fq, NUM_FRAMES, &idx);
+    for (int i=0;i<NUM_FRAMES;i++)
+        *xsk_ring_prod__fill_addr(&fq, idx+i) = i*FRAME_SIZE;
+    xsk_ring_prod__submit(&fq, NUM_FRAMES);
 
+    printf("RUNNING: LAN %s → WAN %s (FORCED)\n", lan_if, wan_if);
+
+    /* ===== LOOP ===== */
     while (running) {
-        uint32_t idx;
-        uint32_t n = xsk_ring_cons__peek(&rx, 32, &idx);
-        if (!n) { usleep(1000); continue; }
+        uint32_t rcvd = xsk_ring_cons__peek(&rx, 32, &idx);
+        if (!rcvd) { usleep(1000); continue; }
 
-        for (uint32_t i=0;i<n;i++) {
+        for (uint32_t i=0;i<rcvd;i++) {
             uint64_t addr = xsk_ring_cons__rx_desc(&rx, idx+i)->addr;
             uint32_t len  = xsk_ring_cons__rx_desc(&rx, idx+i)->len;
-            uint8_t *pkt  = xsk_umem__get_data(buf, addr);
+            void *pkt = (char*)buf + addr;
 
-            /* ===== HOOK 1: encrypt_packet(pkt,len) ===== */
+            /* SEND THẲNG RA enp5s0 */
+            sendto(wan_fd, pkt, len, 0,
+                   (void*)&wan_addr, sizeof(wan_addr));
 
-            int w = select_wan();
-
-            /* ===== HOOK 2: set MAC / rewrite header ===== */
-
-            struct sockaddr_ll s = {
-                .sll_family  = AF_PACKET,
-                .sll_ifindex = wan_ifindex[w],
-            };
-            sendto(wan_fd[w], pkt, len, 0, (void *)&s, sizeof(s));
-
-            /* return frame */
+            /* trả frame */
             uint32_t f;
             xsk_ring_prod__reserve(&fq,1,&f);
             *xsk_ring_prod__fill_addr(&fq,f) = addr;
             xsk_ring_prod__submit(&fq,1);
         }
-        xsk_ring_cons__release(&rx,n);
+        xsk_ring_cons__release(&rx, rcvd);
     }
+
     return 0;
 }
 
