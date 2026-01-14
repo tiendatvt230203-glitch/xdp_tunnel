@@ -1,312 +1,314 @@
 #define _GNU_SOURCE
-
-#include <bpf/libbpf.h>
-#include <bpf/bpf.h>
-#include <xdp/xsk.h>
-
-#include <errno.h>
-#include <linux/if_link.h>
-#include <net/if.h>
-#include <poll.h>
-#include <signal.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-#include <sys/mman.h>
+#include <signal.h>
+#include <net/if.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
-#include <sys/types.h>
+#include <sys/ioctl.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
+#include <linux/ip.h>
+#include <net/if_arp.h>
+#include <bpf/libbpf.h>
+#include <bpf/bpf.h>
+#include <xdp/xsk.h>
+
+#define NUM_FRAMES  4096
+#define FRAME_SIZE  XSK_UMEM__DEFAULT_FRAME_SIZE
+#define MAX_WAN     3
+#define WINDOW_SIZE 65536
 
 static volatile int running = 1;
-static void sigint_handler(int s) { (void)s; running = 0; }
+static void sig_handler(int sig) { (void)sig; running = 0; }
 
-static void die(const char *m) {
-    fprintf(stderr, "%s: %s\n", m, strerror(errno));
-    exit(1);
+// Config
+static char local_if[32];
+static int local_ifindex;
+static uint32_t remote_net, remote_mask;
+static int num_wan = 0;
+static char wan_if[MAX_WAN][32];
+static int wan_ifindex[MAX_WAN];
+static int wan_fd[MAX_WAN];
+static uint8_t wan_src_mac[MAX_WAN][6];
+static uint8_t wan_dst_mac[MAX_WAN][6];
+static int local_fd;
+static uint8_t local_mac[6];
+
+// BPF objects per interface
+static struct bpf_object *local_obj;
+static struct bpf_object *wan_obj[MAX_WAN];
+
+// AF_XDP for local
+static struct xsk_socket *local_xsk;
+static struct xsk_ring_cons local_rx;
+static struct xsk_ring_prod local_fq;
+static struct xsk_umem *local_umem;
+static void *local_buffer;
+
+// AF_XDP for WANs
+static struct xsk_socket *wan_xsk[MAX_WAN];
+static struct xsk_ring_cons wan_rx[MAX_WAN];
+static struct xsk_ring_prod wan_fq[MAX_WAN];
+static struct xsk_umem *wan_umem[MAX_WAN];
+static void *wan_buffer[MAX_WAN];
+
+// Flow table
+static struct { uint32_t bytes; int wan; } flow_table[10000];
+
+static int get_mac(const char *ifname, uint8_t *mac) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq ifr = {0};
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
+    ioctl(fd, SIOCGIFHWADDR, &ifr);
+    close(fd);
+    memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+    return 0;
 }
 
-#define FRAME_SIZE   2048
-#define NUM_FRAMES   4096
-#define RX_SIZE      1024
-#define TX_SIZE      1024
-
-static inline __u32 xsk_key(int ifindex, int qid)
-{
-    return ((__u32)ifindex << 16) | ((__u32)qid & 0xFFFF);
+static int get_peer_mac(const char *ifname, const char *ip, uint8_t *mac) {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "ping -c1 -W1 -I %s %s >/dev/null 2>&1", ifname, ip);
+    system(cmd);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct arpreq q = {0};
+    ((struct sockaddr_in*)&q.arp_pa)->sin_family = AF_INET;
+    inet_pton(AF_INET, ip, &((struct sockaddr_in*)&q.arp_pa)->sin_addr);
+    strncpy(q.arp_dev, ifname, 15);
+    int ret = ioctl(fd, SIOCGARP, &q);
+    close(fd);
+    if (!ret) memcpy(mac, q.arp_ha.sa_data, 6);
+    return ret;
 }
 
-struct port {
-    const char *ifname;
-    int ifindex;
+static int load_config(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[256], key[32], v1[64], v2[64];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        v2[0] = 0;
+        int n = sscanf(line, "%s %s %s", key, v1, v2);
+        if (n < 2) continue;
+        if (!strcmp(key, "local")) {
+            strcpy(local_if, v1);
+            local_ifindex = if_nametoindex(v1);
+            get_mac(v1, local_mac);
+        } else if (!strcmp(key, "remote")) {
+            char *sl = strchr(v1, '/');
+            int pfx = 24;
+            if (sl) { *sl = 0; pfx = atoi(sl+1); }
+            remote_net = ntohl(inet_addr(v1));
+            remote_mask = 0xFFFFFFFF << (32 - pfx);
+        } else if (!strcmp(key, "wan") && num_wan < MAX_WAN) {
+            strcpy(wan_if[num_wan], v1);
+            wan_ifindex[num_wan] = if_nametoindex(v1);
+            get_mac(v1, wan_src_mac[num_wan]);
+            if (v2[0]) get_peer_mac(v1, v2, wan_dst_mac[num_wan]);
+            num_wan++;
+        }
+    }
+    fclose(f);
+    return num_wan > 0 ? 0 : -1;
+}
 
-    __u32 xdp_flags;
+static int create_raw_socket(const char *ifname, int ifindex) {
+    int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (fd < 0) return -1;
+    struct sockaddr_ll sll = {0};
+    sll.sll_family = AF_PACKET;
+    sll.sll_ifindex = ifindex;
+    sll.sll_protocol = htons(ETH_P_ALL);
+    bind(fd, (struct sockaddr*)&sll, sizeof(sll));
+    return fd;
+}
 
-    void *umem_area;
-    struct xsk_umem *umem;
-    struct xsk_ring_prod fill;
+static int setup_xsk(const char *ifname, int xsk_map_fd,
+                     struct xsk_socket **xsk, struct xsk_ring_cons *rx,
+                     struct xsk_ring_prod *fq, struct xsk_umem **umem, void **buffer) {
+    posix_memalign(buffer, getpagesize(), NUM_FRAMES * FRAME_SIZE);
+
+    struct xsk_umem_config ucfg = { .fill_size = NUM_FRAMES, .comp_size = NUM_FRAMES, .frame_size = FRAME_SIZE };
     struct xsk_ring_cons comp;
+    xsk_umem__create(umem, *buffer, NUM_FRAMES * FRAME_SIZE, fq, &comp, &ucfg);
 
-    struct xsk_socket *xsk;
-    struct xsk_ring_cons rx;
-    struct xsk_ring_prod tx;
-};
-
-static int port_setup_xsk(struct port *p, int queue_id)
-{
-    size_t umem_sz = (size_t)NUM_FRAMES * FRAME_SIZE;
-    p->umem_area = mmap(NULL, umem_sz, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-    if (p->umem_area == MAP_FAILED) return -1;
-
-    struct xsk_umem_config ucfg = {
-        .fill_size = RX_SIZE,
-        .comp_size = TX_SIZE,
-        .frame_size = FRAME_SIZE,
-        .frame_headroom = 0,
-        .flags = 0,
-    };
-
-    int err = xsk_umem__create(&p->umem, p->umem_area, umem_sz,
-                              &p->fill, &p->comp, &ucfg);
-    if (err) { errno = -err; return -1; }
-
-    // fill ring: nạp toàn bộ frame
-    __u32 idx = 0;
-    int r = xsk_ring_prod__reserve(&p->fill, NUM_FRAMES, &idx);
-    if (r != NUM_FRAMES) return -1;
-
-    for (int i = 0; i < NUM_FRAMES; i++)
-        *xsk_ring_prod__fill_addr(&p->fill, idx + i) = (unsigned long long)i * FRAME_SIZE;
-
-    xsk_ring_prod__submit(&p->fill, NUM_FRAMES);
-
-    // ÉP COPY + SKB để igc/driver nào cũng chạy được
-    struct xsk_socket_config cfg = {
-        .rx_size = RX_SIZE,
-        .tx_size = TX_SIZE,
+    struct xsk_socket_config xcfg = {
+        .rx_size = NUM_FRAMES, .tx_size = NUM_FRAMES,
         .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
-        .xdp_flags = XDP_FLAGS_SKB_MODE,
-        .bind_flags = XDP_COPY,
     };
+    struct xsk_ring_prod tx;
+    if (xsk_socket__create(xsk, ifname, 0, *umem, rx, &tx, &xcfg) < 0) return -1;
 
-    err = xsk_socket__create(&p->xsk, p->ifname, queue_id, p->umem, &p->rx, &p->tx, &cfg);
-    if (err) { errno = -err; return -1; }
+    int fd = xsk_socket__fd(*xsk);
+    uint32_t idx = 0;
+    bpf_map_update_elem(xsk_map_fd, &idx, &fd, BPF_ANY);
+
+    uint32_t fidx;
+    xsk_ring_prod__reserve(fq, NUM_FRAMES, &fidx);
+    for (uint32_t i = 0; i < NUM_FRAMES; i++)
+        *xsk_ring_prod__fill_addr(fq, fidx + i) = i * FRAME_SIZE;
+    xsk_ring_prod__submit(fq, NUM_FRAMES);
 
     return 0;
 }
 
-static inline void *umem_ptr(struct port *p, __u64 addr)
-{
-    return (void *)((char *)p->umem_area + addr);
-}
+static int attach_xdp(const char *bpf_path, int ifindex, uint32_t direction,
+                      struct bpf_object **obj_out, int *xsk_map_fd) {
+    struct bpf_object *obj = bpf_object__open_file(bpf_path, NULL);
+    if (libbpf_get_error(obj)) return -1;
+    if (bpf_object__load(obj)) { bpf_object__close(obj); return -1; }
 
-static inline void recycle_addr(struct port *p, __u64 addr)
-{
-    __u32 idx = 0;
-    if (xsk_ring_prod__reserve(&p->fill, 1, &idx) == 1) {
-        *xsk_ring_prod__fill_addr(&p->fill, idx) = addr;
-        xsk_ring_prod__submit(&p->fill, 1);
+    struct bpf_program *prog = bpf_object__find_program_by_name(obj, "xdp_redirect_to_user");
+    int cfg_map = bpf_object__find_map_fd_by_name(obj, "config");
+    *xsk_map_fd = bpf_object__find_map_fd_by_name(obj, "xsks_map");
+
+    if (!prog || cfg_map < 0 || *xsk_map_fd < 0) { bpf_object__close(obj); return -1; }
+
+    uint32_t k = 0, v = remote_net;
+    bpf_map_update_elem(cfg_map, &k, &v, BPF_ANY);
+    k = 1; v = remote_mask;
+    bpf_map_update_elem(cfg_map, &k, &v, BPF_ANY);
+    k = 2; v = direction;
+    bpf_map_update_elem(cfg_map, &k, &v, BPF_ANY);
+
+    if (bpf_set_link_xdp_fd(ifindex, bpf_program__fd(prog), 0) < 0) {
+        bpf_object__close(obj);
+        return -1;
     }
+
+    *obj_out = obj;
+    return 0;
 }
 
-static void reap_completions(struct port *p)
-{
-    __u32 idx = 0;
-    int n = xsk_ring_cons__peek(&p->comp, 64, &idx);
-    if (n > 0) {
-        for (int i = 0; i < n; i++) {
-            __u64 a = *xsk_ring_cons__comp_addr(&p->comp, idx + i);
-            recycle_addr(p, a);
+static int select_wan(uint8_t *pkt, int len) {
+    struct iphdr *ip = (struct iphdr*)(pkt + 14);
+    uint32_t h = (ip->saddr ^ ip->daddr) % 10000;
+    flow_table[h].bytes += ntohs(ip->tot_len);
+    if (flow_table[h].bytes >= WINDOW_SIZE) {
+        flow_table[h].wan = (flow_table[h].wan + 1) % num_wan;
+        flow_table[h].bytes = 0;
+    }
+    return flow_table[h].wan;
+}
+
+static void process_local_rx(void) {
+    uint32_t idx = 0;
+    uint32_t rcvd = xsk_ring_cons__peek(&local_rx, 64, &idx);
+    if (rcvd == 0) return;
+
+    for (uint32_t i = 0; i < rcvd; i++) {
+        uint64_t addr = xsk_ring_cons__rx_desc(&local_rx, idx + i)->addr;
+        uint32_t len = xsk_ring_cons__rx_desc(&local_rx, idx + i)->len;
+        uint8_t *pkt = xsk_umem__get_data(local_buffer, addr);
+
+        int w = select_wan(pkt, len);
+        memcpy(pkt, wan_dst_mac[w], 6);
+        memcpy(pkt + 6, wan_src_mac[w], 6);
+
+        struct sockaddr_ll sll = {0};
+        sll.sll_family = AF_PACKET;
+        sll.sll_ifindex = wan_ifindex[w];
+        sll.sll_halen = 6;
+        memcpy(sll.sll_addr, wan_dst_mac[w], 6);
+        sendto(wan_fd[w], pkt, len, 0, (struct sockaddr*)&sll, sizeof(sll));
+
+        uint32_t fidx;
+        if (xsk_ring_prod__reserve(&local_fq, 1, &fidx)) {
+            *xsk_ring_prod__fill_addr(&local_fq, fidx) = addr;
+            xsk_ring_prod__submit(&local_fq, 1);
         }
-        xsk_ring_cons__release(&p->comp, n);
     }
+    xsk_ring_cons__release(&local_rx, rcvd);
 }
 
-static void forward_copy(struct port *src, struct port *dst, __u64 addr, __u32 len)
-{
-    __u32 idx_f = 0;
-    if (xsk_ring_prod__reserve(&dst->fill, 1, &idx_f) != 1) {
-        recycle_addr(src, addr);
-        return;
+static void process_wan_rx(int w) {
+    uint32_t idx = 0;
+    uint32_t rcvd = xsk_ring_cons__peek(&wan_rx[w], 64, &idx);
+    if (rcvd == 0) return;
+
+    for (uint32_t i = 0; i < rcvd; i++) {
+        uint64_t addr = xsk_ring_cons__rx_desc(&wan_rx[w], idx + i)->addr;
+        uint32_t len = xsk_ring_cons__rx_desc(&wan_rx[w], idx + i)->len;
+        uint8_t *pkt = xsk_umem__get_data(wan_buffer[w], addr);
+
+        struct sockaddr_ll sll = {0};
+        sll.sll_family = AF_PACKET;
+        sll.sll_ifindex = local_ifindex;
+        sendto(local_fd, pkt, len, 0, (struct sockaddr*)&sll, sizeof(sll));
+
+        uint32_t fidx;
+        if (xsk_ring_prod__reserve(&wan_fq[w], 1, &fidx)) {
+            *xsk_ring_prod__fill_addr(&wan_fq[w], fidx) = addr;
+            xsk_ring_prod__submit(&wan_fq[w], 1);
+        }
     }
-
-    __u64 dst_addr = *xsk_ring_prod__fill_addr(&dst->fill, idx_f);
-    xsk_ring_prod__submit(&dst->fill, 1);
-
-    void *sp = umem_ptr(src, addr);
-    void *dp = umem_ptr(dst, dst_addr);
-    if (len > FRAME_SIZE) len = FRAME_SIZE;
-    memcpy(dp, sp, len);
-
-    __u32 idx_tx = 0;
-    if (xsk_ring_prod__reserve(&dst->tx, 1, &idx_tx) == 1) {
-        struct xdp_desc *txd = xsk_ring_prod__tx_desc(&dst->tx, idx_tx);
-        txd->addr = dst_addr;
-        txd->len  = len;
-        xsk_ring_prod__submit(&dst->tx, 1);
-
-        // COPY mode: cứ kick
-        sendto(xsk_socket__fd(dst->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-    } else {
-        recycle_addr(dst, dst_addr);
-    }
-
-    recycle_addr(src, addr);
+    xsk_ring_cons__release(&wan_rx[w], rcvd);
 }
 
-static void usage(const char *p)
-{
-    fprintf(stderr,
-        "Usage: %s <bpf.o> <lan_if=enp7s0> <wan_if1> [wan_if2] [wan_if3]...\n"
-        "Example: %s tunnel.bpf.o enp7s0 enp4s0 enp5s0 enp6s0\n", p, p);
+static void cleanup(void) {
+    if (local_ifindex) bpf_set_link_xdp_fd(local_ifindex, -1, 0);
+    if (local_xsk) xsk_socket__delete(local_xsk);
+    if (local_umem) xsk_umem__delete(local_umem);
+    if (local_buffer) free(local_buffer);
+    if (local_obj) bpf_object__close(local_obj);
+
+    for (int i = 0; i < num_wan; i++) {
+        if (wan_ifindex[i]) bpf_set_link_xdp_fd(wan_ifindex[i], -1, 0);
+        if (wan_xsk[i]) xsk_socket__delete(wan_xsk[i]);
+        if (wan_umem[i]) xsk_umem__delete(wan_umem[i]);
+        if (wan_buffer[i]) free(wan_buffer[i]);
+        if (wan_obj[i]) bpf_object__close(wan_obj[i]);
+        if (wan_fd[i] > 0) close(wan_fd[i]);
+    }
+    if (local_fd > 0) close(local_fd);
 }
 
-int main(int argc, char **argv)
-{
-    if (argc < 4) { usage(argv[0]); return 1; }
-
-    const char *bpf_obj = argv[1];
-    const char *lan_if  = argv[2];
-    int wan_n = argc - 3;
-    if (wan_n > 16) die("too many wans");
-
-    signal(SIGINT, sigint_handler);
-    signal(SIGTERM, sigint_handler);
-
-    // 1) Load BPF ONCE
-    struct bpf_object *obj = bpf_object__open_file(bpf_obj, NULL);
-    if (libbpf_get_error(obj)) die("bpf_object__open_file failed");
-    if (bpf_object__load(obj)) die("bpf_object__load failed");
-
-    struct bpf_program *prog = bpf_object__find_program_by_name(obj, "xdp_xsk_redirect");
-    if (!prog) die("cannot find program xdp_xsk_redirect");
-    int prog_fd = bpf_program__fd(prog);
-    if (prog_fd < 0) die("bpf_program__fd failed");
-
-    struct bpf_map *m = bpf_object__find_map_by_name(obj, "xsks_map");
-    if (!m) die("cannot find map xsks_map");
-    int map_fd = bpf_map__fd(m);
-    if (map_fd < 0) die("bpf_map__fd failed");
-
-    // 2) Prepare ports
-    struct port lan = {.ifname = lan_if};
-    struct port wans[16] = {0};
-
-    lan.ifindex = if_nametoindex(lan.ifname);
-    if (!lan.ifindex) die("if_nametoindex LAN failed");
-
-    for (int i = 0; i < wan_n; i++) {
-        wans[i].ifname = argv[i + 3];
-        wans[i].ifindex = if_nametoindex(wans[i].ifname);
-        if (!wans[i].ifindex) die("if_nametoindex WAN failed");
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: %s <config> [bpf.o]\n", argv[0]);
+        return 1;
     }
 
-    // 3) Attach SAME program to ALL interfaces (SKB mode for safety)
-    __u32 xdp_flags = XDP_FLAGS_SKB_MODE;
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
 
-    if (bpf_set_link_xdp_fd(lan.ifindex, prog_fd, xdp_flags) < 0)
-        die("attach XDP on LAN failed");
-
-    for (int i = 0; i < wan_n; i++) {
-        if (bpf_set_link_xdp_fd(wans[i].ifindex, prog_fd, xdp_flags) < 0)
-            die("attach XDP on WAN failed");
+    if (load_config(argv[1]) < 0) {
+        fprintf(stderr, "Config error\n");
+        return 1;
     }
 
-    // 4) Create XSK per interface and bind into ONE shared xsks_map
-    if (port_setup_xsk(&lan, 0) < 0) die("LAN xsk setup failed");
-    {
-        int xsk_fd = xsk_socket__fd(lan.xsk);
-        __u32 key = xsk_key(lan.ifindex, 0);
-        if (bpf_map_update_elem(map_fd, &key, &xsk_fd, BPF_ANY) < 0)
-            die("LAN bpf_map_update_elem failed");
+    const char *bpf_path = argc >= 3 ? argv[2] : "./tunnel.bpf.o";
+
+    local_fd = create_raw_socket(local_if, local_ifindex);
+    for (int i = 0; i < num_wan; i++)
+        wan_fd[i] = create_raw_socket(wan_if[i], wan_ifindex[i]);
+
+    int local_xsk_map;
+    if (attach_xdp(bpf_path, local_ifindex, 0, &local_obj, &local_xsk_map) < 0) {
+        cleanup();
+        return 1;
     }
 
-    for (int i = 0; i < wan_n; i++) {
-        if (port_setup_xsk(&wans[i], 0) < 0) die("WAN xsk setup failed");
-        int xsk_fd = xsk_socket__fd(wans[i].xsk);
-        __u32 key = xsk_key(wans[i].ifindex, 0);
-        if (bpf_map_update_elem(map_fd, &key, &xsk_fd, BPF_ANY) < 0)
-            die("WAN bpf_map_update_elem failed");
+    setup_xsk(local_if, local_xsk_map, &local_xsk, &local_rx,
+              &local_fq, &local_umem, &local_buffer);
 
-        printf("WAN[%d]=%s (ifindex=%d) ready\n", i, wans[i].ifname, wans[i].ifindex);
+    for (int i = 0; i < num_wan; i++) {
+        int wan_xsk_map;
+        attach_xdp(bpf_path, wan_ifindex[i], 1, &wan_obj[i], &wan_xsk_map);
+        setup_xsk(wan_if[i], wan_xsk_map, &wan_xsk[i],
+                  &wan_rx[i], &wan_fq[i], &wan_umem[i], &wan_buffer[i]);
     }
-
-    printf("OK. Forwarding:\n");
-    printf("  LAN(%s) -> choose WAN\n", lan.ifname);
-    printf("  WAN(*)  -> LAN(%s)\n", lan.ifname);
-    printf("Ctrl+C to stop (detaches XDP).\n");
-
-    struct pollfd fds[1 + 16];
-    int rr = 0;
 
     while (running) {
-        int nfds = 0;
-
-        fds[nfds++] = (struct pollfd){ .fd = xsk_socket__fd(lan.xsk), .events = POLLIN };
-        for (int i = 0; i < wan_n; i++)
-            fds[nfds++] = (struct pollfd){ .fd = xsk_socket__fd(wans[i].xsk), .events = POLLIN };
-
-        int ret = poll(fds, nfds, 10);
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            die("poll failed");
-        }
-
-        // LAN -> WAN (RR)
-        if (fds[0].revents & POLLIN) {
-            __u32 idx = 0;
-            int n = xsk_ring_cons__peek(&lan.rx, 64, &idx);
-            if (n > 0) {
-                for (int i = 0; i < n; i++) {
-                    const struct xdp_desc *d = xsk_ring_cons__rx_desc(&lan.rx, idx + i);
-                    int pick = rr++ % wan_n;
-                    forward_copy(&lan, &wans[pick], d->addr, d->len);
-                }
-                xsk_ring_cons__release(&lan.rx, n);
-            }
-        }
-
-        // WAN -> LAN
-        for (int wi = 0; wi < wan_n; wi++) {
-            if (fds[1 + wi].revents & POLLIN) {
-                __u32 idx = 0;
-                int n = xsk_ring_cons__peek(&wans[wi].rx, 64, &idx);
-                if (n > 0) {
-                    for (int i = 0; i < n; i++) {
-                        const struct xdp_desc *d = xsk_ring_cons__rx_desc(&wans[wi].rx, idx + i);
-                        forward_copy(&wans[wi], &lan, d->addr, d->len);
-                    }
-                    xsk_ring_cons__release(&wans[wi].rx, n);
-                }
-            }
-        }
-
-        reap_completions(&lan);
-        for (int i = 0; i < wan_n; i++) reap_completions(&wans[i]);
+        process_local_rx();
+        for (int i = 0; i < num_wan; i++)
+            process_wan_rx(i);
+        usleep(100);
     }
 
-    // detach all
-    (void)bpf_set_link_xdp_fd(lan.ifindex, -1, xdp_flags);
-    for (int i = 0; i < wan_n; i++)
-        (void)bpf_set_link_xdp_fd(wans[i].ifindex, -1, xdp_flags);
-
-    // cleanup
-    if (lan.xsk) xsk_socket__delete(lan.xsk);
-    if (lan.umem) xsk_umem__delete(lan.umem);
-    if (lan.umem_area && lan.umem_area != MAP_FAILED)
-        munmap(lan.umem_area, (size_t)NUM_FRAMES * FRAME_SIZE);
-
-    for (int i = 0; i < wan_n; i++) {
-        if (wans[i].xsk) xsk_socket__delete(wans[i].xsk);
-        if (wans[i].umem) xsk_umem__delete(wans[i].umem);
-        if (wans[i].umem_area && wans[i].umem_area != MAP_FAILED)
-            munmap(wans[i].umem_area, (size_t)NUM_FRAMES * FRAME_SIZE);
-    }
-
-    bpf_object__close(obj);
-    printf("Stopped.\n");
+    cleanup();
     return 0;
 }
 
