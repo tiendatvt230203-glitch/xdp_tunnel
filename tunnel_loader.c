@@ -1,9 +1,11 @@
 #define _GNU_SOURCE
+
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <xdp/xsk.h>
 
 #include <errno.h>
+#include <linux/if_link.h>   // XDP_FLAGS_SKB_MODE
 #include <net/if.h>
 #include <poll.h>
 #include <signal.h>
@@ -12,6 +14,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include <sys/mman.h>        // mmap/munmap
+#include <sys/socket.h>      // sendto
+#include <sys/types.h>
 
 static volatile int running = 1;
 static void sigint_handler(int s) { (void)s; running = 0; }
@@ -46,7 +52,7 @@ struct port {
     struct xsk_ring_cons rx;
     struct xsk_ring_prod tx;
 
-    bool need_wakeup;
+    bool need_wakeup; // kept but we force always-kick
 };
 
 static int port_setup_xsk(struct port *p, int queue_id)
@@ -63,28 +69,41 @@ static int port_setup_xsk(struct port *p, int queue_id)
         .frame_headroom = 0,
         .flags = 0,
     };
-    int err = xsk_umem__create(&p->umem, p->umem_area, umem_sz, &p->fill, &p->comp, &ucfg);
+
+    int err = xsk_umem__create(&p->umem, p->umem_area, umem_sz,
+                              &p->fill, &p->comp, &ucfg);
     if (err) { errno = -err; return -1; }
 
-    // Pre-fill fill ring
-    __u32 idx;
+    // Pre-fill fill ring with all frames
+    __u32 idx = 0;
     int r = xsk_ring_prod__reserve(&p->fill, NUM_FRAMES, &idx);
     if (r != NUM_FRAMES) return -1;
+
     for (int i = 0; i < NUM_FRAMES; i++)
         *xsk_ring_prod__fill_addr(&p->fill, idx + i) = (unsigned long long)i * FRAME_SIZE;
+
     xsk_ring_prod__submit(&p->fill, NUM_FRAMES);
 
+    // IMPORTANT: force COPY mode + SKB XDP mode to avoid driver ZC limitations
     struct xsk_socket_config cfg = {
         .rx_size = RX_SIZE,
         .tx_size = TX_SIZE,
-        .libbpf_flags = 0,
-        .xdp_flags = p->xdp_flags,
-        .bind_flags = 0,
+
+        // We already attach XDP ourselves (bpf_set_link_xdp_fd),
+        // so prevent libbpf from trying to autoload another program.
+        .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
+
+        .xdp_flags = XDP_FLAGS_SKB_MODE, // force generic
+        .bind_flags = XDP_COPY,          // force copy mode
     };
+
     err = xsk_socket__create(&p->xsk, p->ifname, queue_id, p->umem, &p->rx, &p->tx, &cfg);
     if (err) { errno = -err; return -1; }
 
-    p->need_wakeup = xsk_socket__needs_wakeup(p->xsk);
+    // libbpf on your system may not export xsk_socket__needs_wakeup()
+    // and COPY mode works fine with always-kick
+    p->need_wakeup = true;
+
     return 0;
 }
 
@@ -108,13 +127,10 @@ static int port_load_attach_bpf(struct port *p, const char *bpf_obj_path)
     p->map_fd = bpf_map__fd(m);
     if (p->map_fd < 0) return -1;
 
-    // Attach (native -> fallback generic)
-    p->xdp_flags = 0;
-    if (bpf_set_link_xdp_fd(p->ifindex, p->prog_fd, p->xdp_flags) < 0) {
-        p->xdp_flags = XDP_FLAGS_SKB_MODE;
-        if (bpf_set_link_xdp_fd(p->ifindex, p->prog_fd, p->xdp_flags) < 0)
-            return -1;
-    }
+    // IMPORTANT: force SKB mode attach (generic) for compatibility
+    p->xdp_flags = XDP_FLAGS_SKB_MODE;
+    if (bpf_set_link_xdp_fd(p->ifindex, p->prog_fd, p->xdp_flags) < 0)
+        return -1;
 
     return 0;
 }
@@ -145,7 +161,7 @@ static inline void *umem_ptr(struct port *p, __u64 addr)
 
 static inline void recycle_addr(struct port *p, __u64 addr)
 {
-    __u32 idx;
+    __u32 idx = 0;
     if (xsk_ring_prod__reserve(&p->fill, 1, &idx) == 1) {
         *xsk_ring_prod__fill_addr(&p->fill, idx) = addr;
         xsk_ring_prod__submit(&p->fill, 1);
@@ -154,22 +170,20 @@ static inline void recycle_addr(struct port *p, __u64 addr)
 
 static inline void kick_tx(struct port *p)
 {
-    if (p->need_wakeup) {
-        sendto(xsk_socket__fd(p->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
-    }
+    // Always kick (safe for COPY mode)
+    (void)p;
+    // Use the destination socket fd when sending (done at call site)
 }
 
-// Forward: take packet buffer from src UMEM, copy to dst UMEM frame, TX dst.
-// (Copy cho dễ hiểu. Muốn zero-copy phức tạp hơn nhiều.)
 static void forward_copy(struct port *src, struct port *dst, __u64 addr, __u32 len)
 {
-    // Get dst free frame
-    __u32 idx_f;
+    // Take a free dst frame from dst->fill ring
+    __u32 idx_f = 0;
     if (xsk_ring_prod__reserve(&dst->fill, 1, &idx_f) != 1) {
-        // dst out of buffers => drop
         recycle_addr(src, addr);
         return;
     }
+
     __u64 dst_addr = *xsk_ring_prod__fill_addr(&dst->fill, idx_f);
     xsk_ring_prod__submit(&dst->fill, 1);
 
@@ -178,26 +192,27 @@ static void forward_copy(struct port *src, struct port *dst, __u64 addr, __u32 l
     if (len > FRAME_SIZE) len = FRAME_SIZE;
     memcpy(dp, sp, len);
 
-    // TX
-    __u32 idx_tx;
+    // TX on dst
+    __u32 idx_tx = 0;
     if (xsk_ring_prod__reserve(&dst->tx, 1, &idx_tx) == 1) {
         struct xdp_desc *txd = xsk_ring_prod__tx_desc(&dst->tx, idx_tx);
         txd->addr = dst_addr;
         txd->len  = len;
         xsk_ring_prod__submit(&dst->tx, 1);
-        kick_tx(dst);
+
+        // kick TX (COPY mode)
+        sendto(xsk_socket__fd(dst->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
     } else {
-        // no TX slots => drop
         recycle_addr(dst, dst_addr);
     }
 
-    // recycle src addr
+    // Recycle src frame back to src->fill
     recycle_addr(src, addr);
 }
 
 static void reap_completions(struct port *p)
 {
-    __u32 idx;
+    __u32 idx = 0;
     int n = xsk_ring_cons__peek(&p->comp, 64, &idx);
     if (n > 0) {
         for (int i = 0; i < n; i++) {
@@ -212,7 +227,7 @@ static void usage(const char *p)
 {
     fprintf(stderr,
         "Usage: %s <bpf.o> <lan_if=enp7s0> <wan_if1> [wan_if2] [wan_if3]...\n"
-        "Example: %s xdp_xsk.bpf.o enp7s0 enp4s0 enp5s0 enp6s0\n", p, p);
+        "Example: %s tunnel.bpf.o enp7s0 enp4s0 enp5s0 enp6s0\n", p, p);
 }
 
 int main(int argc, char **argv)
@@ -230,12 +245,12 @@ int main(int argc, char **argv)
     struct port wans[16] = {0};
     if (wan_n > 16) die("too many wans");
 
-    // Load/attach BPF + setup XSK for LAN
+    // LAN
     if (port_load_attach_bpf(&lanp, bpf_obj) < 0) die("LAN load/attach failed");
     if (port_setup_xsk(&lanp, 0) < 0) die("LAN xsk setup failed");
     if (port_bind_xsk_to_map(&lanp, 0) < 0) die("LAN bind xsk->map failed");
 
-    // Load/attach BPF + setup XSK for each WAN
+    // WANs
     for (int i = 0; i < wan_n; i++) {
         wans[i].ifname = argv[i + 3];
         if (port_load_attach_bpf(&wans[i], bpf_obj) < 0) die("WAN load/attach failed");
@@ -249,7 +264,6 @@ int main(int argc, char **argv)
     printf("  WAN(*)  -> LAN(%s)\n", lanp.ifname);
     printf("Ctrl+C to stop (detaches XDP).\n");
 
-    // Poll fds
     struct pollfd fds[1 + 16];
     int rr = 0;
 
@@ -257,7 +271,6 @@ int main(int argc, char **argv)
         int nfds = 0;
 
         fds[nfds++] = (struct pollfd){ .fd = xsk_socket__fd(lanp.xsk), .events = POLLIN };
-
         for (int i = 0; i < wan_n; i++) {
             fds[nfds++] = (struct pollfd){ .fd = xsk_socket__fd(wans[i].xsk), .events = POLLIN };
         }
@@ -268,9 +281,9 @@ int main(int argc, char **argv)
             die("poll failed");
         }
 
-        // 1) LAN -> WAN (RR)
+        // LAN -> WAN (round robin)
         if (fds[0].revents & POLLIN) {
-            __u32 idx;
+            __u32 idx = 0;
             int n = xsk_ring_cons__peek(&lanp.rx, 64, &idx);
             if (n > 0) {
                 for (int i = 0; i < n; i++) {
@@ -282,10 +295,10 @@ int main(int argc, char **argv)
             }
         }
 
-        // 2) WAN -> LAN
+        // WAN -> LAN
         for (int wi = 0; wi < wan_n; wi++) {
             if (fds[1 + wi].revents & POLLIN) {
-                __u32 idx;
+                __u32 idx = 0;
                 int n = xsk_ring_cons__peek(&wans[wi].rx, 64, &idx);
                 if (n > 0) {
                     for (int i = 0; i < n; i++) {
@@ -302,7 +315,6 @@ int main(int argc, char **argv)
         for (int i = 0; i < wan_n; i++) reap_completions(&wans[i]);
     }
 
-    // Cleanup
     port_detach_close(&lanp);
     for (int i = 0; i < wan_n; i++) port_detach_close(&wans[i]);
 
