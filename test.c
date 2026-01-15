@@ -1,157 +1,139 @@
-// gcc -O2 -Wall xdp_recv.c -o xdp_recv -lbpf -lxdp -lelf -lz
+// xdp_kern.c
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+
+struct {
+    __uint(type, BPF_MAP_TYPE_XSKMAP);
+    __uint(max_entries, 64);
+    __type(key, __u32);
+    __type(value, __u32);
+} xsks_map SEC(".maps");
+
+SEC("xdp")
+int xdp_redirect_prog(struct xdp_md *ctx)
+{
+    __u32 qid = ctx->rx_queue_index;
+
+    if (bpf_map_lookup_elem(&xsks_map, &qid))
+        return bpf_redirect_map(&xsks_map, qid, 0);
+
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+
+
+// xdp_user.c
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <poll.h>
-#include <arpa/inet.h>
+#include <errno.h>
 #include <net/if.h>
 
-#include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <linux/udp.h>
-
 #include <bpf/bpf.h>
-#include <xdp/xsk.h>
+#include <bpf/libbpf.h>
+#include <bpf/xsk.h>
 
-#define NUM_IFS 3
-static const char *ifs[NUM_IFS] = {"enp4s0","enp5s0","enp6s0"};
-
-#define FRAMES 4096
+#define NUM_FRAMES 4096
 #define FRAME_SIZE XSK_UMEM__DEFAULT_FRAME_SIZE
-#define RX_BATCH 64
+#define RX_BATCH   64
 
-static void parse(void *data, size_t len, const char *ifn)
+static void hexdump(void *data, int len)
 {
-    struct ethhdr *eth = data;
-    if (len < sizeof(*eth)) return;
-
-    printf("[%s] ETH %02x:%02x:%02x:%02x:%02x:%02x -> "
-           "%02x:%02x:%02x:%02x:%02x:%02x\n",
-        ifn,
-        eth->h_source[0],eth->h_source[1],eth->h_source[2],
-        eth->h_source[3],eth->h_source[4],eth->h_source[5],
-        eth->h_dest[0],eth->h_dest[1],eth->h_dest[2],
-        eth->h_dest[3],eth->h_dest[4],eth->h_dest[5]);
-
-    if (ntohs(eth->h_proto) != ETH_P_IP) return;
-
-    struct iphdr *ip = (void *)(eth + 1);
-    struct in_addr s = {ip->saddr}, d = {ip->daddr};
-
-    printf("[%s] IP %s -> %s proto=%u\n",
-           ifn, inet_ntoa(s), inet_ntoa(d), ip->protocol);
-
-    if (ip->protocol == IPPROTO_UDP) {
-        struct udphdr *u = (void *)((char*)ip + ip->ihl*4);
-        printf("[%s] UDP %u -> %u\n",
-               ifn, ntohs(u->source), ntohs(u->dest));
+    unsigned char *p = data;
+    for (int i = 0; i < len; i++) {
+        printf("%02x ", p[i]);
+        if ((i & 15) == 15) printf("\n");
     }
-    printf("----\n");
+    printf("\n\n");
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-    /* === LẤY MAP FD ĐÃ CÓ TRONG KERNEL === */
-    int xsks_map_fd = bpf_obj_get("/sys/fs/bpf/xsks_map");
-    if (xsks_map_fd < 0) {
-        perror("bpf_obj_get xsks_map");
-        return 1;
-    }
-
-    /* === UMEM === */
-    void *buf = aligned_alloc(getpagesize(), FRAMES * FRAME_SIZE);
-
+    const char *ifname = "eth0";
+    int ifindex = if_nametoindex(ifname);
+    void *umem_buf;
     struct xsk_umem *umem;
     struct xsk_ring_prod fq;
-    struct xsk_ring_cons cq;
+    struct xsk_ring_cons rx;
+    struct xsk_socket *xsk;
+    int xsks_map_fd;
+    uint32_t idx;
 
-    struct xsk_umem_config ucfg = {
-        .fill_size = 2048,
-        .comp_size = 2048,
+    /* UMEM */
+    posix_memalign(&umem_buf, getpagesize(),
+                   NUM_FRAMES * FRAME_SIZE);
+
+    struct xsk_umem_config umem_cfg = {
+        .fill_size = NUM_FRAMES,
+        .comp_size = NUM_FRAMES,
         .frame_size = FRAME_SIZE,
-        .frame_headroom = XSK_UMEM__DEFAULT_FRAME_HEADROOM,
-        .flags = 0,
+        .frame_headroom = 0,
     };
 
-    if (xsk_umem__create(&umem, buf, FRAMES * FRAME_SIZE,
-                         &fq, &cq, &ucfg)) {
-        perror("xsk_umem__create");
-        return 1;
-    }
+    xsk_umem__create(&umem, umem_buf,
+                     NUM_FRAMES * FRAME_SIZE,
+                     &fq, NULL, &umem_cfg);
 
-    __u32 idx;
-    xsk_ring_prod__reserve(&fq, 2048, &idx);
-    for (int i = 0; i < 2048; i++)
+    /* Populate fill ring */
+    xsk_ring_prod__reserve(&fq, NUM_FRAMES, &idx);
+    for (int i = 0; i < NUM_FRAMES; i++)
         *xsk_ring_prod__fill_addr(&fq, idx + i) = i * FRAME_SIZE;
-    xsk_ring_prod__submit(&fq, 2048);
+    xsk_ring_prod__submit(&fq, NUM_FRAMES);
 
-    /* === SOCKETS === */
-    struct xsk_socket *xsk[NUM_IFS];
-    struct xsk_ring_cons rx[NUM_IFS];
-
-    struct xsk_socket_config sc = {
-        .rx_size = 2048,
+    /* XSK socket */
+    struct xsk_socket_config xsk_cfg = {
+        .rx_size = 1024,
         .tx_size = 0,
-        .libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD,
-        .xdp_flags = XDP_FLAGS_DRV_MODE,
-        .bind_flags = XDP_USE_NEED_WAKEUP,
+        .xdp_flags = XDP_FLAGS_UPDATE_IF_NOEXIST,
+        .bind_flags = XDP_COPY,
     };
 
-    for (int i = 0; i < NUM_IFS; i++) {
-        if (xsk_socket__create(&xsk[i], ifs[i], 0,
-                               umem, &rx[i], NULL, &sc)) {
-            perror("xsk_socket__create");
-            return 1;
-        }
+    xsk_socket__create(&xsk, ifname, 0, umem,
+                       &rx, NULL, &xsk_cfg);
 
-        int fd = xsk_socket__fd(xsk[i]);
-        __u32 key = 0;
-        if (bpf_map_update_elem(xsks_map_fd, &key, &fd, 0)) {
-            perror("bpf_map_update_elem");
-            return 1;
-        }
+    /* Load XDP & get xsks_map fd */
+    struct bpf_object *obj;
+    obj = bpf_object__open_file("xdp_kern.o", NULL);
+    bpf_object__load(obj);
+    bpf_object__attach_xdp(obj, ifindex);
 
-        printf("AF_XDP bound to %s\n", ifs[i]);
-    }
+    xsks_map_fd = bpf_object__find_map_fd_by_name(obj, "xsks_map");
 
-    /* === RX LOOP === */
-    struct pollfd pfd[NUM_IFS];
+    int fd = xsk_socket__fd(xsk);
+    int key = 0;
+    bpf_map_update_elem(xsks_map_fd, &key, &fd, 0);
 
+    printf("AF_XDP running on %s\n", ifname);
+
+    /* RX loop */
     while (1) {
-        for (int i = 0; i < NUM_IFS; i++) {
-            pfd[i].fd = xsk_socket__fd(xsk[i]);
-            pfd[i].events = POLLIN;
+        unsigned int rcvd;
+        uint32_t idx_rx = 0;
+
+        rcvd = xsk_ring_cons__peek(&rx, RX_BATCH, &idx_rx);
+        if (!rcvd)
+            continue;
+
+        for (int i = 0; i < rcvd; i++) {
+            struct xdp_desc *d;
+            void *pkt;
+
+            d = xsk_ring_cons__rx_desc(&rx, idx_rx + i);
+            pkt = xsk_umem__get_data(umem_buf, d->addr);
+
+            printf("RX packet len=%u\n", d->len);
+            hexdump(pkt, d->len);
         }
 
-        poll(pfd, NUM_IFS, -1);
-
-        for (int i = 0; i < NUM_IFS; i++) {
-            if (!(pfd[i].revents & POLLIN)) continue;
-
-            __u32 rx_idx;
-            unsigned rcvd = xsk_ring_cons__peek(&rx[i], RX_BATCH, &rx_idx);
-            if (!rcvd) continue;
-
-            __u32 fq_idx;
-            xsk_ring_prod__reserve(&fq, rcvd, &fq_idx);
-
-            for (unsigned j = 0; j < rcvd; j++) {
-                const struct xdp_desc *d =
-                    xsk_ring_cons__rx_desc(&rx[i], rx_idx + j);
-
-                void *pkt = xsk_umem__get_data(
-                    buf, xsk_umem__add_offset_to_addr(d->addr));
-
-                parse(pkt, d->len, ifs[i]);
-
-                *xsk_ring_prod__fill_addr(&fq, fq_idx + j) =
-                    xsk_umem__extract_addr(d->addr);
-            }
-
-            xsk_ring_prod__submit(&fq, rcvd);
-            xsk_ring_cons__release(&rx[i], rcvd);
-        }
+        xsk_ring_cons__release(&rx, rcvd);
     }
 }
+
+
+clang -O2 -g -target bpf -c xdp_kern.c -o xdp_kern.o
+gcc xdp_user.c -o xdp_user \
+    -lbpf -lelf -lpthread
 
