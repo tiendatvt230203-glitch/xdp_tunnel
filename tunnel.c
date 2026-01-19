@@ -1,3 +1,4 @@
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,12 @@
 
 #ifndef XDP_FLAGS_UPDATE_IF_NOEXIST
 #define XDP_FLAGS_UPDATE_IF_NOEXIST (1U << 0)
+#endif
+#ifndef XDP_FLAGS_SKB_MODE
+#define XDP_FLAGS_SKB_MODE (1U << 1)
+#endif
+#ifndef XDP_FLAGS_DRV_MODE
+#define XDP_FLAGS_DRV_MODE (1U << 2)
 #endif
 
 #define FRAMES 4096
@@ -156,9 +163,13 @@ static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
         }
     }
 
-    /* Attach XDP - force replace if exists */
-    bpf_set_link_xdp_fd(x->ifindex, -1, 0);  /* detach any existing */
-    ret = bpf_set_link_xdp_fd(x->ifindex, x->prog_fd, 0);  /* attach without NOEXIST flag */
+    /* Attach XDP - force detach all modes first */
+    bpf_set_link_xdp_fd(x->ifindex, -1, XDP_FLAGS_SKB_MODE);
+    bpf_set_link_xdp_fd(x->ifindex, -1, XDP_FLAGS_DRV_MODE);
+    bpf_set_link_xdp_fd(x->ifindex, -1, 0);
+
+    /* Try SKB mode (generic) - works on all drivers */
+    ret = bpf_set_link_xdp_fd(x->ifindex, x->prog_fd, XDP_FLAGS_SKB_MODE);
     if(ret < 0) {
         fprintf(stderr, "[%s] Failed to attach XDP: %d\n", ifname, ret);
         return -1;
@@ -209,7 +220,7 @@ static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
 }
 
 static void cleanup_xsk(struct xsk *x) {
-    if(x->ifindex) bpf_set_link_xdp_fd(x->ifindex, -1, 0);
+    if(x->ifindex) bpf_set_link_xdp_fd(x->ifindex, -1, XDP_FLAGS_SKB_MODE);
     if(x->sock) xsk_socket__delete(x->sock);
     if(x->umem) xsk_umem__delete(x->umem);
     if(x->buf) free(x->buf);
