@@ -10,11 +10,17 @@
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <arpa/inet.h>
+#include <linux/if_link.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <bpf/xsk.h>
+
+/* XDP flags */
+#ifndef XDP_FLAGS_UPDATE_IF_NOEXIST
+#define XDP_FLAGS_UPDATE_IF_NOEXIST (1U << 0)
+#endif
 
 #define FRAMES 4096
 #define FSIZE  4096
@@ -106,7 +112,10 @@ static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
     x->obj = bpf_object__open_file("xdp_kern.o", NULL);
     bpf_object__load(x->obj);
     x->map_fd = bpf_object__find_map_fd_by_name(x->obj, "xsks_map");
-    x->prog_fd = bpf_program__fd(bpf_object__next_program(x->obj, NULL));
+
+    /* Get first program fd */
+    struct bpf_program *prog = bpf_program__next(NULL, x->obj);
+    x->prog_fd = bpf_program__fd(prog);
 
     /* Set mode in config map */
     int cfg_fd = bpf_object__find_map_fd_by_name(x->obj, "config");
@@ -118,18 +127,18 @@ static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
         bpf_map_update_elem(cfg_fd, &k1, &local_mask, 0);
     }
 
-    /* Attach XDP */
-    bpf_xdp_detach(x->ifindex, 0, NULL);  /* detach old first */
-    bpf_xdp_attach(x->ifindex, x->prog_fd, 0, NULL);
+    /* Attach XDP (use old API for compatibility) */
+    bpf_set_link_xdp_fd(x->ifindex, -1, 0);  /* detach old first */
+    bpf_set_link_xdp_fd(x->ifindex, x->prog_fd, XDP_FLAGS_UPDATE_IF_NOEXIST);
 
     /* Create UMEM */
-    posix_memalign(&x->buf, getpagesize(), FRAMES*FSIZE);
+    if(posix_memalign(&x->buf, getpagesize(), FRAMES*FSIZE)) return -1;
     struct xsk_umem_config ucfg = {.fill_size=FRAMES, .comp_size=FRAMES, .frame_size=FSIZE};
     xsk_umem__create(&x->umem, x->buf, FRAMES*FSIZE, &x->fq, &x->cq, &ucfg);
 
     /* Fill ring */
-    __u32 idx;
-    xsk_ring_prod__reserve(&x->fq, FRAMES, &idx);
+    __u32 idx = 0;
+    if(xsk_ring_prod__reserve(&x->fq, FRAMES, &idx) != FRAMES) return -1;
     for(int i=0; i<FRAMES; i++)
         *xsk_ring_prod__fill_addr(&x->fq, idx+i) = i*FSIZE;
     xsk_ring_prod__submit(&x->fq, FRAMES);
@@ -150,7 +159,7 @@ static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
 }
 
 static void cleanup_xsk(struct xsk *x) {
-    bpf_xdp_detach(x->ifindex, 0, NULL);
+    bpf_set_link_xdp_fd(x->ifindex, -1, 0);  /* detach XDP */
     if(x->sock) xsk_socket__delete(x->sock);
     if(x->umem) xsk_umem__delete(x->umem);
     if(x->buf) free(x->buf);
