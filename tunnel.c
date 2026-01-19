@@ -1,4 +1,3 @@
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +13,8 @@
 #include <linux/if_link.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <errno.h>
+
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 #include <bpf/xsk.h>
@@ -31,6 +32,10 @@
 #define FRAMES 4096
 #define FSIZE  4096
 #define BATCH  64
+
+/* Vì interface của bạn đang xdpgeneric => dùng SKB mode */
+#define XDP_MODE_FLAGS XDP_FLAGS_SKB_MODE
+#define XSK_BIND_FLAGS XDP_COPY   /* generic thường phải COPY */
 
 static volatile int running = 1;
 
@@ -57,28 +62,48 @@ static struct xsk local_xsk, wan_xsk;
 /* ========== HELPERS ========== */
 static void get_mac(const char *ifname, uint8_t *mac) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return;
+
     struct ifreq ifr = {0};
     strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
-    ioctl(fd, SIOCGIFHWADDR, &ifr);
-    memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) == 0)
+        memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+
     close(fd);
 }
 
 static void parse_mac(const char *s, uint8_t *mac) {
     unsigned int m[6];
-    sscanf(s, "%x:%x:%x:%x:%x:%x", &m[0],&m[1],&m[2],&m[3],&m[4],&m[5]);
-    for(int i=0;i<6;i++) mac[i]=m[i];
+    if (sscanf(s, "%x:%x:%x:%x:%x:%x",
+               &m[0],&m[1],&m[2],&m[3],&m[4],&m[5]) != 6) {
+        memset(mac, 0, 6);
+        return;
+    }
+    for(int i=0;i<6;i++) mac[i]=(uint8_t)m[i];
 }
 
 static void parse_cidr(const char *s, uint32_t *net, uint32_t *mask) {
-    char ip[32]; int prefix=24;
-    strcpy(ip, s);
+    char ip[32];
+    int prefix = 24;
+
+    strncpy(ip, s, sizeof(ip)-1);
+    ip[sizeof(ip)-1] = 0;
+
     char *p = strchr(ip, '/');
     if(p) { *p=0; prefix=atoi(p+1); }
+    if (prefix < 0) prefix = 0;
+    if (prefix > 32) prefix = 32;
+
     struct in_addr a;
-    inet_pton(AF_INET, ip, &a);
+    if (inet_pton(AF_INET, ip, &a) != 1) {
+        *net = 0;
+        *mask = 0;
+        return;
+    }
+
     *net = ntohl(a.s_addr);
-    *mask = ~0U << (32-prefix);
+    *mask = (prefix == 0) ? 0 : (~0U << (32-prefix));
 }
 
 /* ========== LOAD CONFIG ========== */
@@ -92,17 +117,19 @@ static int load_config(const char *path, int wan_idx) {
     while(fgets(line, sizeof(line), f)) {
         if(line[0]=='#' || line[0]=='\n') continue;
         v1[0]=v2[0]=v3[0]=0;
-        sscanf(line, "%s %s %s %s", key, v1, v2, v3);
+        sscanf(line, "%31s %63s %63s %63s", key, v1, v2, v3);
 
         if(!strcmp(key,"local")) {
-            strcpy(local_if, v1);
+            strncpy(local_if, v1, sizeof(local_if)-1);
+            local_if[sizeof(local_if)-1] = 0;
             get_mac(v1, local_mac);
         }
         else if(!strcmp(key,"localnet")) parse_cidr(v1, &local_net, &local_mask);
         else if(!strcmp(key,"client")) parse_mac(v1, client_mac);
         else if(!strcmp(key,"wan")) {
             if(wan_count == wan_idx) {
-                strcpy(wan_if, v1);
+                strncpy(wan_if, v1, sizeof(wan_if)-1);
+                wan_if[sizeof(wan_if)-1] = 0;
                 get_mac(v1, wan_mac);
                 parse_mac(v3, peer_mac);
             }
@@ -110,6 +137,11 @@ static int load_config(const char *path, int wan_idx) {
         }
     }
     fclose(f);
+
+    if (local_if[0] == 0 || wan_if[0] == 0) {
+        fprintf(stderr, "Config missing local/wan interface (check wan_index)\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -124,7 +156,7 @@ static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
         return -1;
     }
 
-    /* Load BPF */
+    /* Load BPF object */
     x->obj = bpf_object__open_file("xdp_kern.o", NULL);
     if(!x->obj) {
         fprintf(stderr, "[%s] Failed to open xdp_kern.o\n", ifname);
@@ -163,15 +195,16 @@ static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
         }
     }
 
-    /* Attach XDP - force detach all modes first */
+    /* Detach any existing XDP (best-effort) */
     bpf_set_link_xdp_fd(x->ifindex, -1, XDP_FLAGS_SKB_MODE);
     bpf_set_link_xdp_fd(x->ifindex, -1, XDP_FLAGS_DRV_MODE);
     bpf_set_link_xdp_fd(x->ifindex, -1, 0);
 
-    /* Try SKB mode (generic) - works on all drivers */
-    ret = bpf_set_link_xdp_fd(x->ifindex, x->prog_fd, XDP_FLAGS_SKB_MODE);
+    /* Attach XDP in SKB (generic) mode to match xdpgeneric */
+    ret = bpf_set_link_xdp_fd(x->ifindex, x->prog_fd, XDP_MODE_FLAGS);
     if(ret < 0) {
-        fprintf(stderr, "[%s] Failed to attach XDP: %d\n", ifname, ret);
+        fprintf(stderr, "[%s] Failed to attach XDP (flags=0x%x): %d\n",
+                ifname, XDP_MODE_FLAGS, ret);
         return -1;
     }
 
@@ -182,7 +215,12 @@ static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
         return -1;
     }
 
-    struct xsk_umem_config ucfg = {.fill_size=FRAMES, .comp_size=FRAMES, .frame_size=FSIZE};
+    struct xsk_umem_config ucfg = {
+        .fill_size  = FRAMES,
+        .comp_size  = FRAMES,
+        .frame_size = FSIZE
+    };
+
     ret = xsk_umem__create(&x->umem, x->buf, FRAMES*FSIZE, &x->fq, &x->cq, &ucfg);
     if(ret) {
         fprintf(stderr, "[%s] xsk_umem__create failed: %d\n", ifname, ret);
@@ -197,30 +235,39 @@ static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
         return -1;
     }
     for(int i=0; i<FRAMES; i++)
-        *xsk_ring_prod__fill_addr(&x->fq, idx+i) = i*FSIZE;
+        *xsk_ring_prod__fill_addr(&x->fq, idx+i) = (__u64)i * FSIZE;
     xsk_ring_prod__submit(&x->fq, FRAMES);
 
-    /* Create socket */
+    /* Create AF_XDP socket
+     * QUAN TRỌNG: xdp_flags phải khớp với mode attach (xdpgeneric => SKB mode)
+     */
     struct xsk_socket_config xcfg = {
-        .rx_size=2048, .tx_size=2048, .bind_flags=XDP_COPY
+        .rx_size    = 2048,
+        .tx_size    = 2048,
+        .xdp_flags  = XDP_MODE_FLAGS,  /* <<< FIX: match XDP attach mode */
+        .bind_flags = XSK_BIND_FLAGS
     };
-    ret = xsk_socket__create_shared(&x->sock, ifname, 0, x->umem, &x->rx, &x->tx, &x->fq, &x->cq, &xcfg);
+
+    ret = xsk_socket__create_shared(&x->sock, ifname, 0,
+                                    x->umem, &x->rx, &x->tx, &x->fq, &x->cq, &xcfg);
     if(ret) {
-        fprintf(stderr, "[%s] xsk_socket__create_shared failed: %d\n", ifname, ret);
+        fprintf(stderr, "[%s] xsk_socket__create_shared failed: %d (errno=%d %s)\n",
+                ifname, ret, errno, strerror(errno));
         return -1;
     }
 
-    /* Register in map */
+    /* Register in map (key=0) */
     int fd = xsk_socket__fd(x->sock);
     int key = 0;
     bpf_map_update_elem(x->map_fd, &key, &fd, 0);
 
-    printf("[%s] XSK ready (mode=%s)\n", ifname, is_local?"LOCAL":"WAN");
+    printf("[%s] XSK ready (mode=%s, xdp_flags=0x%x)\n",
+           ifname, is_local?"LOCAL":"WAN", XDP_MODE_FLAGS);
     return 0;
 }
 
 static void cleanup_xsk(struct xsk *x) {
-    if(x->ifindex) bpf_set_link_xdp_fd(x->ifindex, -1, XDP_FLAGS_SKB_MODE);
+    if(x->ifindex) bpf_set_link_xdp_fd(x->ifindex, -1, XDP_MODE_FLAGS);
     if(x->sock) xsk_socket__delete(x->sock);
     if(x->umem) xsk_umem__delete(x->umem);
     if(x->buf) free(x->buf);
@@ -248,16 +295,19 @@ static void forward(struct xsk *src, struct xsk *dst, uint8_t *new_src, uint8_t 
         /* Rewrite MAC */
         struct ethhdr *eth = (struct ethhdr*)pkt;
         memcpy(eth->h_source, new_src, 6);
-        memcpy(eth->h_dest, new_dst, 6);
+        memcpy(eth->h_dest,   new_dst, 6);
 
         /* TX to destination */
         if(xsk_ring_prod__reserve(&dst->tx, 1, &tx_idx)) {
+            /* NOTE: code hiện tại copy sang dst->umem theo vòng 256 frame.
+             * Chạy demo OK, nhưng muốn "chuẩn bài" cần allocator/free frame đúng nghĩa.
+             */
             __u64 addr = (i % 256) * FSIZE;
             memcpy(xsk_umem__get_data(dst->buf, addr), pkt, rd->len);
 
             struct xdp_desc *td = xsk_ring_prod__tx_desc(&dst->tx, tx_idx);
             td->addr = addr;
-            td->len = rd->len;
+            td->len  = rd->len;
             xsk_ring_prod__submit(&dst->tx, 1);
 
             sendto(xsk_socket__fd(dst->sock), NULL, 0, MSG_DONTWAIT, NULL, 0);
@@ -298,9 +348,12 @@ int main(int argc, char **argv) {
 
     printf("\n=== AF_XDP Tunnel ===\n");
     printf("LOCAL:  %s -> CLIENT %02x:%02x:%02x:%02x:%02x:%02x\n",
-           local_if, client_mac[0],client_mac[1],client_mac[2],client_mac[3],client_mac[4],client_mac[5]);
+           local_if, client_mac[0],client_mac[1],client_mac[2],
+           client_mac[3],client_mac[4],client_mac[5]);
     printf("WAN:    %s -> PEER   %02x:%02x:%02x:%02x:%02x:%02x\n",
-           wan_if, peer_mac[0],peer_mac[1],peer_mac[2],peer_mac[3],peer_mac[4],peer_mac[5]);
+           wan_if, peer_mac[0],peer_mac[1],peer_mac[2],
+           peer_mac[3],peer_mac[4],peer_mac[5]);
+    printf("XDP mode flags: 0x%x (SKB/generic)\n", XDP_MODE_FLAGS);
     printf("\n");
 
     /* Setup XSK */
@@ -321,13 +374,13 @@ int main(int argc, char **argv) {
     /* Main loop */
     struct pollfd fds[2] = {
         {.fd = xsk_socket__fd(local_xsk.sock), .events = POLLIN},
-        {.fd = xsk_socket__fd(wan_xsk.sock), .events = POLLIN}
+        {.fd = xsk_socket__fd(wan_xsk.sock),   .events = POLLIN}
     };
 
     while(running) {
         poll(fds, 2, 100);
-        forward(&local_xsk, &wan_xsk, wan_mac, peer_mac);
-        forward(&wan_xsk, &local_xsk, local_mac, client_mac);
+        forward(&local_xsk, &wan_xsk,   wan_mac,  peer_mac);
+        forward(&wan_xsk,   &local_xsk, local_mac, client_mac);
     }
 
     printf("\nShutdown...\n");
@@ -336,3 +389,4 @@ int main(int argc, char **argv) {
 
     return 0;
 }
+
