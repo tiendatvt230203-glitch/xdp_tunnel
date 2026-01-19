@@ -17,7 +17,6 @@
 #include <bpf/libbpf.h>
 #include <bpf/xsk.h>
 
-/* XDP flags */
 #ifndef XDP_FLAGS_UPDATE_IF_NOEXIST
 #define XDP_FLAGS_UPDATE_IF_NOEXIST (1U << 0)
 #endif
@@ -76,8 +75,10 @@ static void parse_cidr(const char *s, uint32_t *net, uint32_t *mask) {
 }
 
 /* ========== LOAD CONFIG ========== */
-static void load_config(const char *path, int wan_idx) {
+static int load_config(const char *path, int wan_idx) {
     FILE *f = fopen(path, "r");
+    if(!f) { fprintf(stderr, "Cannot open config: %s\n", path); return -1; }
+
     char line[256], key[32], v1[64], v2[64], v3[64];
     int wan_count = 0;
 
@@ -102,43 +103,88 @@ static void load_config(const char *path, int wan_idx) {
         }
     }
     fclose(f);
+    return 0;
 }
 
 /* ========== SETUP XSK ========== */
 static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
+    int ret;
+    memset(x, 0, sizeof(*x));  /* Clear struct */
+
     x->ifindex = if_nametoindex(ifname);
+    if(!x->ifindex) {
+        fprintf(stderr, "[%s] Interface not found\n", ifname);
+        return -1;
+    }
 
     /* Load BPF */
     x->obj = bpf_object__open_file("xdp_kern.o", NULL);
-    bpf_object__load(x->obj);
+    if(!x->obj) {
+        fprintf(stderr, "[%s] Failed to open xdp_kern.o\n", ifname);
+        return -1;
+    }
+
+    ret = bpf_object__load(x->obj);
+    if(ret) {
+        fprintf(stderr, "[%s] Failed to load BPF object: %d\n", ifname, ret);
+        return -1;
+    }
+
     x->map_fd = bpf_object__find_map_fd_by_name(x->obj, "xsks_map");
+    if(x->map_fd < 0) {
+        fprintf(stderr, "[%s] xsks_map not found\n", ifname);
+        return -1;
+    }
 
     /* Get first program fd */
     struct bpf_program *prog = bpf_program__next(NULL, x->obj);
+    if(!prog) {
+        fprintf(stderr, "[%s] No BPF program found\n", ifname);
+        return -1;
+    }
     x->prog_fd = bpf_program__fd(prog);
 
     /* Set mode in config map */
     int cfg_fd = bpf_object__find_map_fd_by_name(x->obj, "config");
-    __u32 k0=0, k1=1, k2=2;
-    __u32 mode = is_local ? 0 : 1;  /* 0=LOCAL filter, 1=WAN redirect all */
-    bpf_map_update_elem(cfg_fd, &k2, &mode, 0);
-    if(is_local) {
-        bpf_map_update_elem(cfg_fd, &k0, &local_net, 0);
-        bpf_map_update_elem(cfg_fd, &k1, &local_mask, 0);
+    if(cfg_fd >= 0) {
+        __u32 k0=0, k1=1, k2=2;
+        __u32 mode = is_local ? 0 : 1;
+        bpf_map_update_elem(cfg_fd, &k2, &mode, 0);
+        if(is_local) {
+            bpf_map_update_elem(cfg_fd, &k0, &local_net, 0);
+            bpf_map_update_elem(cfg_fd, &k1, &local_mask, 0);
+        }
     }
 
-    /* Attach XDP (use old API for compatibility) */
-    bpf_set_link_xdp_fd(x->ifindex, -1, 0);  /* detach old first */
-    bpf_set_link_xdp_fd(x->ifindex, x->prog_fd, XDP_FLAGS_UPDATE_IF_NOEXIST);
+    /* Attach XDP */
+    bpf_set_link_xdp_fd(x->ifindex, -1, 0);
+    ret = bpf_set_link_xdp_fd(x->ifindex, x->prog_fd, XDP_FLAGS_UPDATE_IF_NOEXIST);
+    if(ret < 0) {
+        fprintf(stderr, "[%s] Failed to attach XDP: %d\n", ifname, ret);
+        return -1;
+    }
 
     /* Create UMEM */
-    if(posix_memalign(&x->buf, getpagesize(), FRAMES*FSIZE)) return -1;
+    ret = posix_memalign(&x->buf, getpagesize(), FRAMES*FSIZE);
+    if(ret) {
+        fprintf(stderr, "[%s] posix_memalign failed\n", ifname);
+        return -1;
+    }
+
     struct xsk_umem_config ucfg = {.fill_size=FRAMES, .comp_size=FRAMES, .frame_size=FSIZE};
-    xsk_umem__create(&x->umem, x->buf, FRAMES*FSIZE, &x->fq, &x->cq, &ucfg);
+    ret = xsk_umem__create(&x->umem, x->buf, FRAMES*FSIZE, &x->fq, &x->cq, &ucfg);
+    if(ret) {
+        fprintf(stderr, "[%s] xsk_umem__create failed: %d\n", ifname, ret);
+        return -1;
+    }
 
     /* Fill ring */
     __u32 idx = 0;
-    if(xsk_ring_prod__reserve(&x->fq, FRAMES, &idx) != FRAMES) return -1;
+    ret = xsk_ring_prod__reserve(&x->fq, FRAMES, &idx);
+    if(ret != FRAMES) {
+        fprintf(stderr, "[%s] fill ring reserve failed: %d\n", ifname, ret);
+        return -1;
+    }
     for(int i=0; i<FRAMES; i++)
         *xsk_ring_prod__fill_addr(&x->fq, idx+i) = i*FSIZE;
     xsk_ring_prod__submit(&x->fq, FRAMES);
@@ -147,7 +193,11 @@ static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
     struct xsk_socket_config xcfg = {
         .rx_size=2048, .tx_size=2048, .bind_flags=XDP_COPY
     };
-    xsk_socket__create_shared(&x->sock, ifname, 0, x->umem, &x->rx, &x->tx, &x->fq, &x->cq, &xcfg);
+    ret = xsk_socket__create_shared(&x->sock, ifname, 0, x->umem, &x->rx, &x->tx, &x->fq, &x->cq, &xcfg);
+    if(ret) {
+        fprintf(stderr, "[%s] xsk_socket__create_shared failed: %d\n", ifname, ret);
+        return -1;
+    }
 
     /* Register in map */
     int fd = xsk_socket__fd(x->sock);
@@ -159,7 +209,7 @@ static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
 }
 
 static void cleanup_xsk(struct xsk *x) {
-    bpf_set_link_xdp_fd(x->ifindex, -1, 0);  /* detach XDP */
+    if(x->ifindex) bpf_set_link_xdp_fd(x->ifindex, -1, 0);
     if(x->sock) xsk_socket__delete(x->sock);
     if(x->umem) xsk_umem__delete(x->umem);
     if(x->buf) free(x->buf);
@@ -168,14 +218,14 @@ static void cleanup_xsk(struct xsk *x) {
 
 /* ========== FORWARD PACKET ========== */
 static void forward(struct xsk *src, struct xsk *dst, uint8_t *new_src, uint8_t *new_dst) {
-    __u32 rx_idx, tx_idx;
+    __u32 rx_idx = 0, tx_idx = 0;
 
     /* RX from source */
     unsigned int n = xsk_ring_cons__peek(&src->rx, BATCH, &rx_idx);
     if(!n) return;
 
     /* Drain completion ring */
-    __u32 cq_idx;
+    __u32 cq_idx = 0;
     unsigned int done = xsk_ring_cons__peek(&dst->cq, FRAMES, &cq_idx);
     if(done) xsk_ring_cons__release(&dst->cq, done);
 
@@ -191,7 +241,7 @@ static void forward(struct xsk *src, struct xsk *dst, uint8_t *new_src, uint8_t 
 
         /* TX to destination */
         if(xsk_ring_prod__reserve(&dst->tx, 1, &tx_idx)) {
-            __u64 addr = (i % 256) * FSIZE;  /* simple addressing */
+            __u64 addr = (i % 256) * FSIZE;
             memcpy(xsk_umem__get_data(dst->buf, addr), pkt, rd->len);
 
             struct xdp_desc *td = xsk_ring_prod__tx_desc(&dst->tx, tx_idx);
@@ -204,7 +254,7 @@ static void forward(struct xsk *src, struct xsk *dst, uint8_t *new_src, uint8_t 
     }
 
     /* Return buffers to fill ring */
-    __u32 fq_idx;
+    __u32 fq_idx = 0;
     if(xsk_ring_prod__reserve(&src->fq, n, &fq_idx) == n) {
         for(unsigned int i=0; i<n; i++) {
             struct xdp_desc *rd = (struct xdp_desc*)xsk_ring_cons__rx_desc(&src->rx, rx_idx+i);
@@ -233,7 +283,7 @@ int main(int argc, char **argv) {
     libbpf_set_print(NULL);
 
     /* Load config */
-    load_config(argv[1], atoi(argv[2]));
+    if(load_config(argv[1], atoi(argv[2])) < 0) return 1;
 
     printf("\n=== AF_XDP Tunnel ===\n");
     printf("LOCAL:  %s -> CLIENT %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -243,8 +293,15 @@ int main(int argc, char **argv) {
     printf("\n");
 
     /* Setup XSK */
-    setup_xsk(&local_xsk, local_if, 1);  /* LOCAL: filter by localnet */
-    setup_xsk(&wan_xsk, wan_if, 0);      /* WAN: redirect all */
+    if(setup_xsk(&local_xsk, local_if, 1) < 0) {
+        fprintf(stderr, "Failed to setup LOCAL XSK\n");
+        return 1;
+    }
+    if(setup_xsk(&wan_xsk, wan_if, 0) < 0) {
+        fprintf(stderr, "Failed to setup WAN XSK\n");
+        cleanup_xsk(&local_xsk);
+        return 1;
+    }
 
     printf("\nRunning... (Ctrl+C to stop)\n");
     printf("  LOCAL RX -> rewrite MAC -> WAN TX\n");
@@ -258,11 +315,7 @@ int main(int argc, char **argv) {
 
     while(running) {
         poll(fds, 2, 100);
-
-        /* LOCAL RX -> WAN TX: rewrite src=wan_mac, dst=peer_mac */
         forward(&local_xsk, &wan_xsk, wan_mac, peer_mac);
-
-        /* WAN RX -> LOCAL TX: rewrite src=local_mac, dst=client_mac */
         forward(&wan_xsk, &local_xsk, local_mac, client_mac);
     }
 
