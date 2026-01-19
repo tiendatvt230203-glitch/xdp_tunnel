@@ -156,9 +156,9 @@ static int setup_xsk(struct xsk *x, const char *ifname, int is_local) {
         }
     }
 
-    /* Attach XDP */
-    bpf_set_link_xdp_fd(x->ifindex, -1, 0);
-    ret = bpf_set_link_xdp_fd(x->ifindex, x->prog_fd, XDP_FLAGS_UPDATE_IF_NOEXIST);
+    /* Attach XDP - force replace if exists */
+    bpf_set_link_xdp_fd(x->ifindex, -1, 0);  /* detach any existing */
+    ret = bpf_set_link_xdp_fd(x->ifindex, x->prog_fd, 0);  /* attach without NOEXIST flag */
     if(ret < 0) {
         fprintf(stderr, "[%s] Failed to attach XDP: %d\n", ifname, ret);
         return -1;
