@@ -41,6 +41,8 @@ static uint8_t client_mac[6];
 static uint8_t wan_mac[MAX_WAN][6];
 static uint8_t wan_peer_mac[MAX_WAN][6];
 static int num_wan = 0;
+static uint32_t local_net = 0;
+static uint32_t local_mask = 0;
 
 /* XSK for LOCAL */
 struct xsk_info {
@@ -100,6 +102,22 @@ static int parse_mac(const char *str, uint8_t *mac) {
     return 0;
 }
 
+static int parse_cidr(const char *str, uint32_t *net, uint32_t *mask) {
+    char ip[32];
+    int prefix = 24;
+    strncpy(ip, str, sizeof(ip) - 1);
+    char *slash = strchr(ip, '/');
+    if (slash) {
+        *slash = 0;
+        prefix = atoi(slash + 1);
+    }
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ip, &addr) != 1) return -1;
+    *net = ntohl(addr.s_addr);
+    *mask = prefix ? (~0U << (32 - prefix)) : 0;
+    return 0;
+}
+
 static int load_config(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
@@ -113,6 +131,8 @@ static int load_config(const char *path) {
         if (!strcmp(key, "local")) {
             strncpy(local_if, v1, sizeof(local_if) - 1);
             get_mac(v1, local_mac);
+        } else if (!strcmp(key, "localnet")) {
+            parse_cidr(v1, &local_net, &local_mask);
         } else if (!strcmp(key, "client")) {
             parse_mac(v1, client_mac);
         } else if (!strcmp(key, "wan") && num_wan < MAX_WAN) {
@@ -129,8 +149,9 @@ static int load_config(const char *path) {
 
 /*
  * Setup XSK exactly like recv.c (which works)
+ * is_local: if true, configure filter for local network
  */
-static int setup_xsk(struct xsk_info *info, const char *ifname) {
+static int setup_xsk(struct xsk_info *info, const char *ifname, int is_local) {
     strncpy(info->ifname, ifname, sizeof(info->ifname) - 1);
 
     printf("[%s] Setting up XSK...\n", ifname);
@@ -153,6 +174,18 @@ static int setup_xsk(struct xsk_info *info, const char *ifname) {
         return -1;
     }
     printf("[%s] BPF loaded, xsks_map fd=%d\n", ifname, info->xsks_map_fd);
+
+    /* Configure local network filter (only for LOCAL interface) */
+    if (is_local && local_net && local_mask) {
+        int config_fd = bpf_object__find_map_fd_by_name(info->bpf_obj, "config");
+        if (config_fd >= 0) {
+            __u32 k0 = 0, k1 = 1;
+            bpf_map_update_elem(config_fd, &k0, &local_net, 0);
+            bpf_map_update_elem(config_fd, &k1, &local_mask, 0);
+            printf("[%s] Filter: local_net=0x%08x mask=0x%08x\n", ifname, local_net, local_mask);
+            printf("[%s] -> Packets to local net: PASS, others: REDIRECT\n", ifname);
+        }
+    }
 
     /* 2. Allocate UMEM */
     if (posix_memalign(&info->buf, getpagesize(), FRAMES * FSIZE)) {
@@ -353,16 +386,16 @@ int main(int argc, char **argv) {
            wan_peer_mac[wan_idx][3], wan_peer_mac[wan_idx][4], wan_peer_mac[wan_idx][5]);
     printf("\n");
 
-    /* Setup XSK for LOCAL */
+    /* Setup XSK for LOCAL (with filter) */
     printf("[SETUP LOCAL]\n");
-    if (setup_xsk(&local_xsk, local_if) < 0) {
+    if (setup_xsk(&local_xsk, local_if, 1) < 0) {
         fprintf(stderr, "Failed to setup LOCAL XSK\n");
         return 1;
     }
 
-    /* Setup XSK for WAN */
+    /* Setup XSK for WAN (no filter - redirect all) */
     printf("\n[SETUP WAN]\n");
-    if (setup_xsk(&wan_xsk, wan_if[wan_idx]) < 0) {
+    if (setup_xsk(&wan_xsk, wan_if[wan_idx], 0) < 0) {
         fprintf(stderr, "Failed to setup WAN XSK\n");
         cleanup_xsk(&local_xsk);
         return 1;
