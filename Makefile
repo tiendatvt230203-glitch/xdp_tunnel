@@ -1,14 +1,31 @@
-CLANG := clang
-CC := gcc
+# AF_XDP Tunnel Makefile
 
-all: tunnel.bpf.o tunnel_xdp
+CC = gcc
+CLANG = clang
 
-tunnel.bpf.o: tunnel.bpf.c
-	$(CLANG) -O2 -g -target bpf -c $< -o $@
+CFLAGS = -Wall -O2 -g
+LDFLAGS = -lbpf -lxdp -lpthread
 
-tunnel_xdp: tunnel_loader.c
-	$(CC) -O2 -g $< -o $@ -lbpf -lxdp
+BPF_CFLAGS = -O2 -g -target bpf -D__TARGET_ARCH_x86
+
+.PHONY: all clean
+
+all: xdp_kern.o tunnel
+        @echo ""
+        @echo "Build complete!"
+        @echo ""
+        @echo "Usage: sudo ./tunnel <config_file> <wan_index>"
+        @echo "Example: sudo ./tunnel config/server1.conf 1"
+        @echo ""
+
+xdp_kern.o: xdp_kern.c
+        $(CLANG) $(BPF_CFLAGS) -c $< -o $@
+        @echo "[OK] Built XDP: $@"
+
+tunnel: tunnel.c
+        $(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+        @echo "[OK] Built tunnel: $@"
 
 clean:
-	rm -f tunnel.bpf.o tunnel_xdp
-
+        rm -f xdp_kern.o tunnel
+        @echo "[OK] Cleaned"
